@@ -525,7 +525,7 @@ def _append_due_monitors(
     )
 
 
-def _append_blocking_user_gate(project: Path) -> None:
+def _append_blocking_user_gate(project: Path, *, global_gate: bool = False) -> None:
     from loopx.control_plane.todos.active_state_todo_parser import parse_active_state_todos
     from loopx.control_plane.todos.machine_section_projection import render_canonical_todo_sections
     from loopx.control_plane.todos.todo_summary import canonical_todo_read_record
@@ -537,6 +537,7 @@ def _append_blocking_user_gate(project: Path) -> None:
         + "  <!-- loopx:todo todo_id=todo_fixture_user_gate status=open "
         + "task_class=user_gate action_kind=approve_delivery "
         + f"blocks_agent={AGENT_ID} "
+        + ("global_gate=true " if global_gate else "")
         + "decision_scope=direction:action:fixture priority=P0-USER -->\n"
     )
     additions = parse_active_state_todos(

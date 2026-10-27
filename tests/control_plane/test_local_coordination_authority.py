@@ -22,6 +22,7 @@ from loopx.control_plane.coordination.legacy_writer_fence import (
     legacy_coordination_writer_fence_path,
 )
 from loopx.control_plane.coordination.local_authority import (
+    CanonicalAuthorityRequired,
     LocalCoordinationAuthorityRejection,
     LocalCoordinationAuthorityUnavailable,
     claim_canonical_todo_if_promoted,
@@ -132,21 +133,13 @@ def test_python_terminal_adapter_rejects_coercible_numeric_values(
     assert not runtime_root.exists()
 
 
-def test_absent_fence_preserves_legacy_path_without_starting_typescript(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    monkeypatch.setattr(
-        "loopx.control_plane.coordination.local_authority.effect_runtime_result",
-        lambda *_args, **_kwargs: pytest.fail("pre-cutover read must stay legacy"),
-    )
-    assert (
-        read_canonical_todos_if_promoted(
-            runtime_root=tmp_path,
-            goal_id="goal-a",
-        )
-        is None
-    )
+def test_absent_fence_refuses_without_reconstructing_legacy_authority(tmp_path: Path) -> None:
+    with pytest.raises(CanonicalAuthorityRequired) as caught:
+        read_canonical_todos_if_promoted(runtime_root=tmp_path, goal_id="goal-a")
+    assert caught.value.code == "canonical_authority_required"
+    assert caught.value.payload["write_admitted"] is False
+    assert caught.value.payload["legacy_fallback_used"] is False
+    assert not legacy_coordination_writer_fence_path(runtime_root=tmp_path, goal_id="goal-a").exists()
 
 
 def test_engaged_fence_reads_typescript_provider_result(

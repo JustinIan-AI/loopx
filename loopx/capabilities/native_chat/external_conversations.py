@@ -131,23 +131,41 @@ class ChatExternalConversations:
         path = self.root / f"{request_ref}.json"
         with exclusive_file_lock(path, operation="admit_external_chat_request"):
             row = self.read_request(request_ref)
+            plan = self._context_recovery_plan(row)
+            if not plan.get("recovery_candidate"):
+                return row
+            session = self.controller.store.load_session(row["session_id"])
+            turn = self.controller.store.load_turn(row["session_id"], row["turn_id"])
+            assert session is not None and turn is not None
+            model_auth_home = checked_session_home(self.controller.codex_home, session)
+            context = self.controller.project_contexts.session_context(session)
+
+            def source_requests() -> list[dict[str, Any]]:
+                return [item for item in self.pending() if item.get("binding_id") == row["binding_id"]
+                    and item.get("source") == row["source"]]
+
+            requests = source_requests()
+            # The read-only native client can consume its entire RPC deadline.
+            # Retain this request's fence, but let new source input/control in.
+            # Its observation is only usable if the original local state still
+            # matches after reacquiring the route fence; fresh authority/source
+            # checks and the typed eligibility decision remain below that fence.
+            proof = None if plan.get("admitted_turn_id") else CodexAppServerAdapter.failed_request_observation(
+                codex_bin=self.controller.codex_bin, codex_home=Path(session["codex_home"]),
+                model_auth_home=model_auth_home,
+                **({"read_only_review": True} if plan.get("read_only_review") else {}),
+                **({"completed_work": True, "work_dir": Path(context["project"])} if plan.get("work_attempt") else {}),
+                thread_ids=plan["native_thread_ids"], turn_id=turn["upstream_turn_id"])
             with exclusive_file_lock(self.root / "source-fences" / f"{row['binding_id']}.{row['source']['source_ref']}.json", operation="route_external_chat_request"):
-                plan = self._context_recovery_plan(row)
-                if not plan.get("recovery_candidate"):
-                    return row
-                session = self.controller.store.load_session(row["session_id"])
-                turn = self.controller.store.load_turn(row["session_id"], row["turn_id"])
-                assert session is not None and turn is not None
-                model_auth_home = checked_session_home(self.controller.codex_home, session)
-                context = self.controller.project_contexts.session_context(session)
-                proof = None if plan.get("admitted_turn_id") else CodexAppServerAdapter.failed_request_observation(
-                    codex_bin=self.controller.codex_bin, codex_home=Path(session["codex_home"]),
-                    model_auth_home=model_auth_home,
-                    **({"read_only_review": True} if plan.get("read_only_review") else {}),
-                    **({"completed_work": True, "work_dir": Path(context["project"])} if plan.get("work_attempt") else {}),
-                    thread_ids=plan["native_thread_ids"], turn_id=turn["upstream_turn_id"])
                 selected = self.bindings.resolve(binding_id=row["binding_id"], **row["source"], include_observation=True)
                 source = source_observation(selected)
+                # Adopting an already admitted Turn only repairs correlation:
+                # its execution and newer input may legitimately have advanced.
+                # The typed planner below must still prove that exact receipt.
+                if not plan.get("admitted_turn_id") and (self.controller.store.load_session(row["session_id"]) != session
+                        or self.controller.store.load_turn(row["session_id"], row["turn_id"]) != turn
+                        or source_requests() != requests):
+                    return row
                 plan = self._context_recovery_plan(row, observation=proof, source_verified=source is not None)
                 if not plan.get("recovery_eligible"):
                     return row

@@ -7,7 +7,7 @@ closed instead of consulting the legacy Markdown projection.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from copy import deepcopy
 from pathlib import Path
 from typing import Any, NoReturn
@@ -348,12 +348,28 @@ class CanonicalTodoSnapshot:
     keep using fresh reads and the provider's transaction checks.
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self, *, runtime_root_for_goal: Callable[[str], Path] | None = None,
+    ) -> None:
+        self._runtime_root_for_goal = runtime_root_for_goal
+        self._routes: dict[str, Path | LocalCoordinationAuthorityUnavailable] = {}
         self._reads: dict[
             tuple[Path, str], dict[str, Any] | LocalCoordinationAuthorityUnavailable
         ] = {}
 
     def read(self, *, runtime_root: Path, goal_id: str) -> dict[str, Any]:
+        if self._runtime_root_for_goal is not None:
+            if goal_id not in self._routes:
+                try:
+                    self._routes[goal_id] = self._runtime_root_for_goal(goal_id)
+                except LocalCoordinationAuthorityUnavailable as error:
+                    self._routes[goal_id] = error
+            route = self._routes[goal_id]
+            if isinstance(route, LocalCoordinationAuthorityUnavailable):
+                raise LocalCoordinationAuthorityUnavailable(
+                    str(route), code=route.code, payload=deepcopy(route.payload),
+                )
+            runtime_root = route
         key = (runtime_root.expanduser().resolve(strict=False), goal_id)
         if key not in self._reads:
             try:

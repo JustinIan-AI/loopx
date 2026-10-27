@@ -27,7 +27,6 @@ from ..capabilities.repository_change_window import (
 )
 from ..control_plane.effect_runtime import EffectRuntimeRejected
 from ..control_plane.coordination.local_authority import CanonicalAuthorityRequired
-from ..control_plane.capability_hooks import InteractionProjectionHookRegistration
 from ..control_plane.goals.first_party_host_admission import (
     capture_first_party_host_goal_ref,
 )
@@ -37,7 +36,6 @@ from ..control_plane.quota.cli_projection import (
     compact_quota_plan_cli_payload,
     compact_quota_should_run_cli_payload,
 )
-from ..control_plane.quota.effective_action import EffectiveAction
 from ..control_plane.quota.effect_program import SettlementIdentity
 from ..control_plane.quota.error_codes import (
     CloseoutQueryUnavailableError,
@@ -108,6 +106,7 @@ from .quota_failure_report import (
 )
 from .quota_host_poll import attach_host_poll_receipt
 from .quota_monitor_poll import (
+    record_automatic_heartbeat_stall as _record_automatic_heartbeat_stall,
     record_quota_monitor_poll_for_cli,
     recover_quota_monitor_poll_for_cli,
 )
@@ -198,106 +197,6 @@ def _quota_renderer(
         "spend-slot": render_quota_slot_preview_markdown,
         "void-slot": render_quota_slot_preview_markdown,
     }.get(command, render_quota_markdown)
-
-
-def _record_automatic_heartbeat_stall(
-    payload: dict[str, object],
-    status_payload: dict[str, object],
-    args: argparse.Namespace,
-    *,
-    registry_path: Path,
-    runtime_root_arg: str | None,
-    context: QuotaCommandContext,
-    interaction_projection_hooks: tuple[InteractionProjectionHookRegistration, ...],
-    turn_start_hook_dispatch: Mapping[str, object] | None,
-    action_selection: RequestedQuotaActionSelection,
-    cache_metadata: object,
-    goal_ref: Mapping[str, object] | None,
-) -> tuple[dict[str, object], dict[str, object], object, str]:
-    """Commit and reproject the automatic no-spend heartbeat observation."""
-
-    turn_id = context.heartbeat_turn_id
-    if turn_id is None:
-        return payload, status_payload, cache_metadata, "not_applicable"
-    existing_stall = find_quota_monitor_poll_turn(
-        context.runtime_root,
-        goal_id=args.goal_id,
-        agent_id=args.agent_id,
-        turn_instance_id=turn_id,
-        goal_ref=goal_ref,
-    )
-    if (
-        payload.get("effective_action")
-        != EffectiveAction.MONITOR_QUIET_SKIP.value
-        and existing_stall is None
-    ):
-        return payload, status_payload, cache_metadata, "not_applicable"
-    poll = record_quota_monitor_poll(
-        status_payload,
-        goal_id=args.goal_id,
-        registry_path=registry_path,
-        execute=True,
-        source="heartbeat",
-        agent_id=args.agent_id,
-        available_capabilities=args.available_capabilities,
-        turn_instance_id=turn_id,
-        goal_ref=goal_ref,
-        scheduler_execution_context=context.scheduler_context,
-        operator_inbox_urgency_projector=context.operator_inbox_urgency_projector,
-        bounded_research_frontier_projector=project_live_explore_composition_frontier,
-    )
-    if not poll.get("ok"):
-        raise RuntimeError(
-            "heartbeat stall observation writeback failed: "
-            f"{poll.get('reason') or 'missing follow-up quota decision'}"
-        )
-    reloaded = collect_status(
-        registry_path=registry_path,
-        runtime_root_override=runtime_root_arg,
-        limit=context.status_limit,
-        goal_id=context.status_goal_id,
-        available_capabilities=args.available_capabilities,
-    )
-    rebuilt = build_live_quota_should_run_decision(
-        reloaded,
-        goal_id=args.goal_id,
-        agent_id=args.agent_id,
-        available_capabilities=args.available_capabilities,
-        include_scheduler_detail="scheduler" in context.detail_sections,
-        include_agent_todo_detail=(
-            "agent-todos" in context.detail_sections
-            and not bool(getattr(args, "turn_envelope", False))
-        ),
-        codex_app_current_rrule=args.app_automation_current_rrule,
-        registry_path=registry_path,
-        runtime_root=context.runtime_root,
-        host_observation_resolver=resolve_codex_app_automation_rrule,
-        scheduler_execution_context=context.scheduler_context,
-        operator_inbox_urgency_projector=context.operator_inbox_urgency_projector,
-        bounded_research_frontier_projector=project_live_explore_composition_frontier,
-        receipt_bound_todo_id=action_selection.receipt_bound_todo_id,
-        receipt_bound_replan_obligation_id=(
-            action_selection.receipt_bound_replan_obligation_id
-        ),
-        retained_action_selection_todo_id=(
-            action_selection.retained_todo_id_for_decision
-        ),
-        turn_instance_id=turn_id,
-        interaction_projection_hooks=interaction_projection_hooks,
-        turn_start_hook_dispatch=turn_start_hook_dispatch,
-        goal_ref=goal_ref,
-    )
-    rebuilt["heartbeat_stall_writeback"] = {
-        "turn_instance_id": turn_id,
-        "status": "replayed" if poll.get("replayed") else "appended",
-        "generated_at": poll.get("generated_at"),
-    }
-    return (
-        rebuilt,
-        reloaded,
-        None,
-        "replayed" if poll.get("replayed") else "appended",
-    )
 
 
 def _dispatch_quota_turn_start_hooks(
@@ -810,6 +709,11 @@ def handle_quota_command(
                         action_selection=action_selection,
                         cache_metadata=cache_metadata,
                         goal_ref=goal_ref,
+                        find_monitor_poll_turn=find_quota_monitor_poll_turn,
+                        monitor_poll_recorder=record_quota_monitor_poll,
+                        status_collector=collect_status,
+                        decision_builder=build_live_quota_should_run_decision,
+                        host_observation_resolver=resolve_codex_app_automation_rrule,
                     )
                     heartbeat_receipt_ready = True
         elif args.quota_command == "monitor-poll":

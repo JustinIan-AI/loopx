@@ -9,7 +9,10 @@ from pathlib import Path
 from typing import Any, Callable
 
 from ..agents.execution_facts import collect_agent_execution_facts
-from ..coordination.local_authority import CanonicalTodoSnapshot
+from ..coordination.local_authority import (
+    CanonicalTodoSnapshot,
+    LocalCoordinationAuthorityUnavailable,
+)
 from ..goals.acceptance_observation import attach_goal_acceptance_observations
 from ..goals.artifact_lifecycle import attach_goal_artifact_lifecycle_projections
 from ..goals.contract_health import project_contract_health_for_goal
@@ -20,6 +23,7 @@ from ..goals.activation import (
 )
 from ..runtime.runtime_projection_route import (
     collect_runtime_projection_route_diagnostics,
+    resolve_goal_source_runtime_route,
 )
 from ..projection_envelope_facts import seal_projection_envelope, source_fact
 from ..quota.blocked_retry import overlay_status_turn_retries
@@ -127,10 +131,28 @@ def collect_status(
     )
     history = history_collection.status_history
     history_read_at = now_utc_iso()
-    todo_snapshot = CanonicalTodoSnapshot()
+    source_snapshots: dict[Path, bytes | None] = {}
+
+    def canonical_runtime_for_goal(current_goal_id: str) -> Path:
+        try:
+            route = resolve_goal_source_runtime_route(
+                registry_path=registry_path, goal_id=current_goal_id,
+                runtime_root_override=runtime_root_override, registry=registry,
+                source_snapshots=source_snapshots,
+            )
+        except (OSError, ValueError) as error:
+            raise LocalCoordinationAuthorityUnavailable(
+                "Canonical Todo source route is unavailable",
+                code="canonical_todo_contract_diagnostics_unavailable",
+                payload={"goal_id": current_goal_id, "write_admitted": False,
+                         "legacy_fallback_used": False},
+            ) from error
+        return Path(route["source_runtime_root"])
+
+    todo_snapshot = CanonicalTodoSnapshot(runtime_root_for_goal=canonical_runtime_for_goal)
     contract = context.check_contract(
         registry_path=registry_path,
-        runtime_root_override=str(runtime_root),
+        runtime_root_override=runtime_root_override,
         scan_roots=[],
         limit=limit,
         allow_missing_registry=allow_missing_registry,

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
@@ -18,9 +17,7 @@ from ..control_plane.goals.first_party_host_admission import (
 from ..control_plane.quota.heartbeat_receipt import (
     ensure_turn_heartbeat_settlement_receipt,
 )
-from ..control_plane.quota.live_decision import (
-    build_live_quota_should_run_decision,
-)
+from ..control_plane.quota.live_decision import build_live_quota_should_run_decision
 from ..control_plane.quota.settlement import (
     SettlementIdentity,
     SettlementStepKind,
@@ -50,6 +47,7 @@ from ..quota import spend_quota_slot
 from ..state_refresh import refresh_state_run
 from ..control_plane.todos.path_resolution import resolve_todo_state_path
 from .turn_cadence import managed_cadence_start
+from .turn_host_request import prepare_turn_host_request
 from .turn_decision import collect_turn_status_payload, current_turn_host_launch_decision
 from .turn_dsh_host import build_dsh_host_runner, build_dsh_operation_host_runner
 from .turn_rendering import build_turn_error_payload
@@ -82,59 +80,11 @@ def execute_turn_run_once(
     """Adapt one prepared CLI Turn plan to the bounded Turn driver."""
     execution_started = False
     try:
-        project = Path(args.project).expanduser().resolve()
-        planned_host = (
-            payload.get("host") if isinstance(payload.get("host"), dict) else {}
-        )
-        if planned_host.get("kind") != args.host:
-            raise ValueError("--host must match the journaled LoopX Turn plan")
-        if args.host == "codex-app-server" and (
-            native_host_runner is None or native_session_binding_resolver is None
-        ):
-            raise ValueError("app-server execution requires its original in-process Chat connection")
-        if args.host != "codex-app-server" and (
-            native_host_runner is not None or native_session_binding_resolver is not None
-        ):
-            raise ValueError("a native Chat connection cannot replace a selected CLI host")
-        if args.host == "generic-cli":
-            if not args.host_command_json:
-                raise ValueError(
-                    "generic-cli requires --host-adapter-command-json "
-                    "(alias --host-command-json)"
-                )
-            raw_argv = json.loads(args.host_command_json)
-            if not isinstance(raw_argv, list) or not all(
-                isinstance(item, str) for item in raw_argv
-            ):
-                raise ValueError(
-                    "--host-adapter-command-json must be a JSON string array"
-                )
-        else:
-            if args.host_command_json:
-                raise ValueError(f"{args.host} does not accept --host-command-json")
-            raw_argv = None
-        if native_task_validator is not None and args.host != "codex-app-server":
-            raise ValueError("a native task validator cannot replace a selected CLI validator")
-        task_validator = native_task_validator
-        if args.validation_command_json:
-            raw_validation_argv = json.loads(args.validation_command_json)
-            if not isinstance(raw_validation_argv, list) or not all(
-                isinstance(item, str) for item in raw_validation_argv
-            ):
-                raise ValueError(
-                    "--validation-command-json must be a JSON string array"
-                )
-            if task_validator is None:
-                task_validator = build_loopx_turn_command_validator(
-                    raw_validation_argv,
-                    project=project,
-                    timeout_seconds=args.validation_timeout_seconds,
-                    failure_recovery_kind=args.validation_failure_kind,
-                )
-        envelope = (
-            payload.get("turn_envelope")
-            if isinstance(payload.get("turn_envelope"), dict)
-            else {}
+        project, raw_argv, task_validator, envelope = prepare_turn_host_request(
+            args, payload, native_host_runner=native_host_runner,
+            native_session_binding_resolver=native_session_binding_resolver,
+            native_task_validator=native_task_validator,
+            validator_builder=build_loopx_turn_command_validator,
         )
         selected_todo = selected_turn_todo(envelope)
         expected_todo_text_sha256 = captured_todo_text_sha256(
