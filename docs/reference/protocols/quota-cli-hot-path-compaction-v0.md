@@ -85,6 +85,56 @@ neither enables native tracing nor changes the default-off transport switch.
 控制字段和原始捕获均保留。`--include-detail agent-todos` 保留内联标题。
 这是普通 CLI 序列化去重，差分开关关闭和开启时均适用，不会开启原生追踪或改变默认关闭。
 
+During the C1 migration, exact current-Task title sharing is owned by the
+TypeScript decision composer in `turn_envelope.ts`. The legacy Python display
+helper shares one coarse transport call with Explore-guidance sharing; each
+explicit detail selector is preserved. No source carrier or both detail selectors
+means no sharing call. Its label-prefix omission stays display-only.
+Complete `loopx_turn_envelope_v1` decisions share before hashing/capture and
+validate the same-capture target on recovery. Conflicting inline/reference values,
+chains, malformed paths or a no-longer-verified selected Task reject even with
+valid integrity hashes. This source sharing does not require differential delivery.
+The `--include-detail` behavior above describes the historical display projection;
+it does not select an alternative complete contract. Retire its delegate with the
+legacy display callers while retaining supported historical capture recovery.
+
+C1 迁移中，当前 Task 标题的精确共享归 `turn_envelope.ts` 的 TypeScript decision
+composer 所有；旧 Python 展示 helper 与 Explore 指引共享合用一次粗粒度调用，
+分别保留 detail 选择；无源载体或两项 detail 均开启时无需共享调用。按 label 前缀
+省略仍仅属于展示。
+完整 `loopx_turn_envelope_v1` 在 hash／capture 前共享，恢复时验证同一 capture 的目标。
+原文／引用冲突、引用链、非法路径或当前选中 Task 无法继续核验时，即使完整性 hash
+有效也拒绝。该来源共享不要求开启差分。上文 `--include-detail` 描述历史展示投影，
+不会选择另一套完整契约；委托随旧展示调用者退役，支持的历史 capture 恢复继续保留。
+
+The same composer also owns exact nested vision-audit sharing. The root keeps the
+full audit and judge; the existing `projection_ref` carries only matching audit
+and judge decision fields. Type-sensitive full-JSON comparison preserves different
+channel facts and short audits inline. Complete readers reject unavailable owners,
+reference chains and conflicting copies before effects. Historical envelopes keep
+the inline-root judge, and the old display adds only its existing metadata. This
+delegate retires with the same caller migration; it is not a second rule owner.
+
+同一 composer 也拥有嵌套 vision audit 的精确共享。根保留完整 audit 和 judge；已有
+`projection_ref` 仅携带匹配的 audit／judge 判定字段。完整 JSON 的类型敏感比较使
+不同 channel 事实和短 audit 保持内联。完整 reader 在产生效果前拒绝不可用 owner、
+引用链及冲突副本。历史 envelope 保留内联根 judge，旧展示只添加既有 metadata；
+委托随同一调用链迁移退役，不构成第二个规则 owner。
+
+A declined `should-run` decision with an interaction contract uses that same
+complete composer before capture. Failure still prevents host handoff and native
+context-baseline publication; validation never grants work or settlement. An
+error before an interaction contract exists remains the original typed diagnostic
+and recovery payload, with either CLI flag spelling. It is neither a fabricated
+work contract nor a historical-envelope fallback. Readers must preserve the
+original receipt and capture when transport fails after admission.
+
+已有 interaction contract 的拒绝 `should-run` 判定也在 capture 前使用同一完整
+composer。失败仍阻止 host handoff 和原生 context baseline 发布，验证不授予工作
+或结算权限。interaction contract 形成前的错误在两种 CLI flag 写法下都保留原
+typed 诊断及恢复 payload，不补造工作契约、不回退历史 envelope。准入后传输失败
+时，reader 必须保留原 receipt 和 capture。
+
 When a replan action carries a complete `vision_authoring` schema, the default
 `quota should-run` packet now retains it, alongside its executable writeback
 summary (`required_fields`, accepted path outcomes, and rule). Only when the

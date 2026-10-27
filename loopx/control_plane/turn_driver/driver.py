@@ -1,6 +1,5 @@
 from __future__ import annotations
 from .turn_contract_generated import LoopXTurnRoute  # compatibility re-export
-from ..quota.effective_action import EffectiveAction
 
 import json
 from collections.abc import Mapping
@@ -20,7 +19,7 @@ from .subagent_execution_topology import (
 )
 from ..quota.turn_envelope import (
     assert_turn_envelope_consumer_version,
-    turn_envelope_action_signature_document,
+    _turn_envelope_result,
     turn_envelope_replan_settlement_identity,
 )
 from ..scheduler.execution_context import (
@@ -35,6 +34,8 @@ LOOPX_ITERATION_CONTEXT_POLICY_SCHEMA_VERSION = (
     "loopx_iteration_context_policy_v0"
 )
 LOOPX_CHILD_HOST_OPERATION_SCHEMA_VERSION = "loopx_child_host_operation_v0"
+_ABSENT_WORK_CONTRACT = object()
+
 SUPPORTED_HOSTS = {"codex-cli", "codex-app-server", "claude-code", "dsh", "generic-cli"}
 SUPPORTED_EXECUTION_MODES = {"interactive-visible", "isolated-headless"}
 SUPPORTED_ITERATION_CONTEXT_POLICIES = {"fresh", "resume"}
@@ -53,78 +54,6 @@ def session_identity_fields(scope: str) -> tuple[str, ...]:
     return ("goal_id", "agent_id")
 
 
-REPLAN_ACTIONS = {
-    "autonomous_replan",
-    "autonomous_replan_required",
-    "successor_replan_required",
-}
-REPAIR_ACTIONS: frozenset[EffectiveAction] = frozenset(
-    {
-        EffectiveAction.AGENT_WORKSPACE_REPAIR,
-        EffectiveAction.BOUNDARY_PROJECTION_REPAIR,
-        EffectiveAction.CAPABILITY_BRIDGE_REPAIR,
-        EffectiveAction.CONTROL_PLANE_HEALTH_REPAIR,
-        EffectiveAction.CONTROL_PLANE_PROJECTION_REPAIR,
-        EffectiveAction.CONTROL_PLANE_REPAIR,
-        EffectiveAction.RUNTIME_USER_GATE_PROJECTION_REPAIR,
-        EffectiveAction.STATE_PROJECTION_GAP_REPAIR,
-        EffectiveAction.TODO_DECISION_SCOPE_PROJECTION_REPAIR,
-    }
-)
-# Registered actions that run on a Host. The root should-run/Envelope slot is a
-# disjoint union of the decision vocabulary and the frontier vocabulary, and
-# every value either owner can carry is classified: replan above, repair above,
-# capability intent in its own branch, and the rest named here. Host execution
-# is therefore a stated classification rather than the absence of a branch, so
-# a newly registered action cannot inherit it silently -- the accompanying test
-# fails until the new value is classified deliberately.
-HOST_EXECUTION_ACTIONS: frozenset[str] = frozenset(
-    {
-        # Decision vocabulary.
-        EffectiveAction.AGENT_MONITOR_ONLY.value,
-        EffectiveAction.AUTOMATION_PROMPT_UPGRADE_REQUIRED.value,
-        EffectiveAction.BLOCKED_HEALTH.value,
-        EffectiveAction.BLOCKED_WAIT.value,
-        EffectiveAction.COORDINATE_TASK_BUNDLE.value,
-        EffectiveAction.EXTERNAL_EVIDENCE_OBSERVE.value,
-        EffectiveAction.HEARTBEAT_RECEIPT_WRITE_FAILED.value,
-        EffectiveAction.HEARTBEAT_SETTLED_SKIP.value,
-        EffectiveAction.LARK_INBOX_REPLY_DUE.value,
-        EffectiveAction.MONITOR_DUE.value,
-        EffectiveAction.MONITOR_QUIET_SKIP.value,
-        EffectiveAction.NORMAL_RUN.value,
-        EffectiveAction.OPERATOR_GATE_NOTIFY.value,
-        EffectiveAction.OPERATOR_INBOX_MATERIAL_REVIEW_DUE.value,
-        EffectiveAction.OUTCOME_FLOOR_RECOVERY.value,
-        EffectiveAction.PEER_COORDINATION_BLOCKED.value,
-        EffectiveAction.QUOTA_SKIP.value,
-        EffectiveAction.SCOPED_USER_GATE_FALLBACK.value,
-        EffectiveAction.TERMINAL_NO_FOLLOWUP.value,
-        EffectiveAction.THROTTLED_SKIP.value,
-        EffectiveAction.UNSETTLED_HOST_TURN_RECOVERY.value,
-        # Frontier vocabulary. These are not EffectiveAction members, so they
-        # are named by value rather than through the enum.
-        "agent_scope_exhausted",
-        "agent_scope_wait",
-        "reassignment_required",
-    }
-)
-
-
-def unregistered_route(effective_action: str) -> LoopXTurnRoute:
-    """Classify an action no registered owner declares.
-
-    Legacy payloads and forward-compatible writers can carry a value this
-    driver does not know. Such a value still runs on a Host: narrowing what the
-    driver accepts is an admission-domain change that needs its own approval and
-    version boundary, so this keeps the previous behaviour. Naming the path
-    separates "this classification was chosen" from "this value was not
-    recognised", which the earlier bare fallthrough could not express.
-    """
-
-    return LoopXTurnRoute.READY_FOR_HOST
-
-
 class FailedTurnSessionRecoveryError(ValueError):
     """Typed public-safe refusal to resume a failed Turn's Host Session."""
 
@@ -137,65 +66,23 @@ def _mapping(value: Any) -> dict[str, Any]:
     return dict(value) if isinstance(value, Mapping) else {}
 
 
-def _typed_route(envelope: Mapping[str, Any]) -> LoopXTurnRoute:
+def _historical_route_text(envelope: Mapping[str, Any]) -> dict[str, str]:
+    """Retain Python str/or encoding for historical, non-string JSON scalars.
+
+    This codec selects no route; the TypeScript owner applies every gate.
+    Complete contracts do not accept these historical decoding hints.
+    """
     signature = _mapping(envelope.get("action_signature"))
-    source_hash = str(signature.get("source_hash") or "")
-    envelope_hash = str(signature.get("envelope_hash") or "")
-    if (
-        signature.get("matches") is not True
-        or not source_hash
-        or source_hash != envelope_hash
-    ):
-        return LoopXTurnRoute.CONTRACT_ERROR
-    # Packet size is a performance warning, not execution authority. Keep the
-    # diagnostics in the envelope; schema/signature/lineage remain hard gates.
+    return {"source_hash": str(signature.get("source_hash") or ""),
+            "envelope_hash": str(signature.get("envelope_hash") or ""),
+            "effective_action": str(envelope.get("effective_action") or "")}
 
-    action = _mapping(envelope.get("action"))
-    user = _mapping(envelope.get("user"))
-    should_run = envelope.get("should_run") is True
-    effective_action = str(envelope.get("effective_action") or "")
-    delivery_allowed = action.get("delivery_allowed") is True
-    must_attempt = action.get("must_attempt") is True
 
-    if should_run:
-        if not must_attempt:
-            return LoopXTurnRoute.BLOCKED
-        # A semantic replan forbids ordinary delivery while requiring the Host
-        # to produce its bound planning outcome. Keep that route distinct from
-        # admission to execute the selected work.
-        if effective_action in REPLAN_ACTIONS:
-            try:
-                # Preserve the typed owner's signed Todo-less binding check.
-                # The plan's lineage gate still holds unbound replans; selected
-                # Todo replans retain their existing Task settlement identity.
-                turn_envelope_replan_settlement_identity(envelope, turn_instance_id=None)
-            except (ValueError, RuntimeError):
-                return LoopXTurnRoute.CONTRACT_ERROR
-            return LoopXTurnRoute.REPLAN_REQUIRED
-        if not delivery_allowed:
-            return LoopXTurnRoute.BLOCKED
-        try:
-            registered_action = EffectiveAction(effective_action)
-        except ValueError:
-            registered_action = None
-        if registered_action is EffectiveAction.GOVERNED_CAPABILITY_INTENT:
-            intent = _mapping(action.get("capability_intent"))
-            if (intent.get("schema_version") != "pending_capability_intent_projection_v0"
-                or intent.get("goal_id") != envelope.get("goal_id")
-                or intent.get("agent_id") != envelope.get("agent_id")
-                or not intent.get("command")):
-                return LoopXTurnRoute.CONTRACT_ERROR
-            return LoopXTurnRoute.CAPABILITY_ACTION_REQUIRED
-        if registered_action in REPAIR_ACTIONS:
-            return LoopXTurnRoute.REPAIR_REQUIRED
-        if effective_action in HOST_EXECUTION_ACTIONS:
-            return LoopXTurnRoute.READY_FOR_HOST
-        return unregistered_route(effective_action)
-    if user.get("action_required") is True:
-        return LoopXTurnRoute.USER_ACTION_REQUIRED
-    if action.get("quiet_noop_allowed") is True:
-        return LoopXTurnRoute.WAIT
-    return LoopXTurnRoute.BLOCKED
+def _typed_route(envelope: Mapping[str, Any]) -> LoopXTurnRoute:
+    """Compatibility transport to the shared TypeScript route owner."""
+    return LoopXTurnRoute(_turn_envelope_result(
+        "driver_route", envelope=dict(envelope), historical_route_text=_historical_route_text(envelope),
+    )["route"])
 
 
 def selected_turn_todo(envelope: Mapping[str, Any]) -> dict[str, Any]:
@@ -214,6 +101,24 @@ def selected_turn_todo(envelope: Mapping[str, Any]) -> dict[str, Any]:
         }
     action = _mapping(envelope.get("action"))
     return _mapping(action.get("selected_todo"))
+
+
+def turn_host_lineage(request: Mapping[str, Any]) -> dict[str, str]:
+    """Read identity from the complete owner, with historical request decoding."""
+    if "work_contract" in request:
+        from ..quota.turn_envelope import _turn_envelope_result
+
+        return _turn_envelope_result(
+            "complete_host_lineage", payload=request["work_contract"],
+            envelope=request.get("turn_envelope"),
+        )
+    envelope = _mapping(request.get("turn_envelope"))
+    todo = selected_turn_todo(envelope)
+    return {
+        "goal_id": str(envelope.get("goal_id") or "").strip(),
+        "agent_id": str(envelope.get("agent_id") or "").strip(),
+        "todo_id": str(todo.get("todo_id") or "").strip(),
+    }
 
 
 def _receipt_bound_replan_identity(
@@ -235,31 +140,30 @@ def _turn_lineage(
     envelope: Mapping[str, Any],
     *,
     selected_todo: Mapping[str, Any],
-    settlement_identity: SettlementIdentity | None = None,
+    work_contract: object = _ABSENT_WORK_CONTRACT,
+    projection: Mapping[str, Any] | None = None,
 ) -> dict[str, str]:
-    signature_document = turn_envelope_action_signature_document(envelope)
-    action = _mapping(signature_document.get("action"))
-    signature_document["action"] = {
-        **action,
-        "selected_todo": dict(selected_todo),
+    resolved = projection if projection is not None else _turn_envelope_result(
+        "driver_lineage", envelope=dict(envelope),
+        **({"payload": work_contract} if work_contract is not _ABSENT_WORK_CONTRACT else
+           {"historical_route_text": _historical_route_text(envelope)}),
+    )
+    if work_contract is _ABSENT_WORK_CONTRACT:
+        # Historical journals retain the exact decoder and JSON preimage.
+        identity = {"goal_id": envelope.get("goal_id"), "agent_id": envelope.get("agent_id"),
+                    "todo_id": selected_todo.get("todo_id")}
+    else:
+        identity = resolved
+    signature = resolved["action_signature"]
+    signature["action"] = {**_mapping(signature.get("action")), "selected_todo": dict(selected_todo)}
+    # Persisted Turn keys depend on Python's JSON number encoding. Keep this
+    # transport codec while the TS owner selects and validates identity facts.
+    return {
+        **{field: str(identity.get(field) or "") for field in ("goal_id", "agent_id", "todo_id")},
+        "action_hash": "sha256:" + sha256(json.dumps(
+            signature, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        ).encode("utf-8")).hexdigest(),
     }
-    action_hash = "sha256:" + sha256(
-        json.dumps(
-            signature_document,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
-    ).hexdigest()
-    lineage = {
-        "goal_id": str(envelope.get("goal_id") or ""),
-        "agent_id": str(envelope.get("agent_id") or ""),
-        "todo_id": str(selected_todo.get("todo_id") or ""),
-        "action_hash": action_hash,
-    }
-    if settlement_identity is not None:
-        lineage["replan_obligation_id"] = str(settlement_identity.replan_obligation_id)
-    return lineage
 
 
 def _session_plan(
@@ -347,13 +251,17 @@ def reconcile_failed_turn_session_request(
     envelope = _mapping(request.get("turn_envelope"))
     selected_todo = selected_turn_todo(envelope)
     try:
+        lineage = _turn_lineage(
+            envelope, selected_todo=selected_todo,
+            work_contract=request.get("work_contract", _ABSENT_WORK_CONTRACT),
+        )
         settlement_identity = (None if selected_todo else _receipt_bound_replan_identity(
             envelope, turn_instance_id=None,
         ))
+        if settlement_identity is not None:
+            lineage["replan_obligation_id"] = str(settlement_identity.replan_obligation_id)
     except (ValueError, RuntimeError) as exc:
         raise FailedTurnSessionRecoveryError("turn_lineage_missing", str(exc)) from exc
-    lineage = _turn_lineage(envelope, selected_todo=selected_todo,
-                            settlement_identity=settlement_identity)
     planned_session = _mapping(request.get("session"))
     session, session_error = _session_plan(
         route=LoopXTurnRoute.READY_FOR_HOST,
@@ -484,8 +392,9 @@ def build_loopx_turn_plan(
     iteration_context_policy: str = "resume",
     session_scope: str | None = None,
     goal_ref: Mapping[str, object] | None = None,
+    work_contract: object = _ABSENT_WORK_CONTRACT,
 ) -> dict[str, Any]:
-    """Project a TurnEnvelope into a typed, side-effect-free host decision."""
+    """Project a checked Turn input into a typed, side-effect-free host decision."""
 
     if host not in SUPPORTED_HOSTS:
         raise ValueError(f"unsupported LoopX Turn host: {host}")
@@ -512,12 +421,21 @@ def build_loopx_turn_plan(
         assert_turn_envelope_consumer_version(envelope)
     except (ValueError, RuntimeError) as exc:
         contract_error = str(exc)
+    selected_todo = selected_turn_todo(envelope)
+    # Check the complete source before route/session/transaction planning. Reuse
+    # the action-hash boundary rather than adding a separate identity call.
+    projection = _turn_envelope_result(
+        "driver_lineage", envelope=envelope,
+        **({"payload": work_contract} if work_contract is not _ABSENT_WORK_CONTRACT else
+           {"historical_route_text": _historical_route_text(envelope)}),
+    )
+    lineage = _turn_lineage(envelope, selected_todo=selected_todo,
+                            work_contract=work_contract, projection=projection)
     route = (
-        _typed_route(envelope)
+        LoopXTurnRoute(projection["route"])
         if execution_context.ok and contract_error is None
         else LoopXTurnRoute.CONTRACT_ERROR
     )
-    selected_todo = selected_turn_todo(envelope)
     settlement_identity = None
     identity_error = None
     if route is LoopXTurnRoute.REPLAN_REQUIRED:
@@ -531,8 +449,8 @@ def build_loopx_turn_plan(
         if (not selected_todo and identity_error is None
                 and (settlement_identity is None or session_scope != "agent")):
             route = LoopXTurnRoute.BLOCKED
-    lineage = _turn_lineage(envelope, selected_todo=selected_todo,
-                            settlement_identity=settlement_identity)
+    if settlement_identity is not None:
+        lineage["replan_obligation_id"] = str(settlement_identity.replan_obligation_id)
     session, session_error = _session_plan(
         route=route,
         lineage=lineage,
@@ -617,6 +535,8 @@ def build_loopx_turn_plan(
             else {}
         ),
     }
+    if work_contract is not _ABSENT_WORK_CONTRACT:
+        payload["work_contract"] = work_contract
     if child_operations:
         payload["child_operations"] = child_operations
         context = envelope_agent_context(

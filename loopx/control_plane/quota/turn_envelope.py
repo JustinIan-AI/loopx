@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import Any
 
 from ..effect_runtime import EffectRuntimeRejected, effect_runtime_result
@@ -24,6 +26,26 @@ ACTION_SIGNATURE_COVERAGE_V4 = "turn_envelope_action_dimensions_v4"
 ACTION_SIGNATURE_COVERAGE_V5 = "turn_envelope_action_dimensions_v5"
 ACTION_SIGNATURE_COVERAGE = ACTION_SIGNATURE_COVERAGE_V0
 PLANNING_HORIZON_DETAIL_REFS_REF = "$.detail_ref"
+
+
+@dataclass(frozen=True, init=False, repr=False, slots=True)
+class TurnControllerInput:
+    """Local producer result; never an agent wire or a retained authority cache.
+
+    The envelope and its typed route originate in one projection. Store the
+    envelope as immutable bytes so a caller cannot mutate it after routing;
+    each consumer receives its own decoded object. Ordinary wire dictionaries
+    cannot supply this qualification through an extra JSON field.
+    """
+
+    envelope_json: str
+    route: str
+
+    def __init__(self) -> None:
+        raise TypeError("Use build_turn_controller_input with the original quota source")
+
+    def envelope(self) -> dict[str, Any]:
+        return json.loads(self.envelope_json)
 
 
 def _turn_envelope_result(
@@ -81,6 +103,20 @@ def turn_envelope_replan_settlement_identity(
     return dict(identity)
 
 
+def compose_turn_decision(
+    payload: Mapping[str, Any], *, scheduler_execution_context: object = None,
+) -> dict[str, Any]:
+    """Transport complete source facts to the existing typed composition owner."""
+    resolution = resolve_scheduler_execution_context(scheduler_execution_context)
+    args = render_scheduler_execution_args(scheduler_execution_context=resolution) if resolution.ok and resolution.context is not None else ""
+    return _turn_envelope_result("compose_complete", payload=dict(payload), scheduler_execution_args=args)
+
+
+def assert_complete_turn_decision(payload: Mapping[str, Any]) -> None:
+    """Validate the original contract; keep its host binding and caller-owned bytes."""
+    _turn_envelope_result("complete_consumer", payload=dict(payload))
+
+
 def build_turn_envelope(
     payload: Mapping[str, Any],
     *,
@@ -91,14 +127,47 @@ def build_turn_envelope(
 ) -> dict[str, Any]:
     """Project one full quota decision through the canonical TS transaction."""
 
+    return _build_turn_projection(payload,
+        scheduler_execution_context=scheduler_execution_context,
+        captured_decision_path=captured_decision_path)
+
+
+def build_turn_controller_input(
+    payload: Mapping[str, Any], *, scheduler_execution_context: object = None,
+) -> TurnControllerInput:
+    """Build the managed controller's envelope and route in one existing RPC."""
+    result = _build_turn_projection(payload,
+        scheduler_execution_context=scheduler_execution_context,
+        operation="build_controller_input")
+    envelope, route = result.get("envelope"), result.get("route")
+    if not isinstance(envelope, Mapping) or not isinstance(route, str):
+        raise RuntimeError("TypeScript controller input must include an envelope and route")
+    projected = object.__new__(TurnControllerInput)
+    object.__setattr__(projected, "envelope_json", json.dumps(dict(envelope), ensure_ascii=False,
+        separators=(",", ":")))
+    object.__setattr__(projected, "route", route)
+    return projected
+
+
+def _build_turn_projection(
+    payload: Mapping[str, Any], *, scheduler_execution_context: object = None,
+    captured_decision_path: str | None = None, operation: str = "build",
+) -> dict[str, Any]:
+
     resolution = resolve_scheduler_execution_context(scheduler_execution_context)
     scheduler_execution_args = ""
     if resolution.ok and resolution.context is not None:
         scheduler_execution_args = render_scheduler_execution_args(
             scheduler_execution_context=resolution,
         )
+    # A captured complete contract already records the original host binding.
+    # Only transport that value when no caller override was supplied; TS checks
+    # its integrity and rejects an explicit conflicting binding.
+    if scheduler_execution_context is None and payload.get("schema_version") == "loopx_turn_envelope_v1":
+        binding = payload.get("contract_binding")
+        scheduler_execution_args = binding.get("scheduler_execution_args") if isinstance(binding, Mapping) else None
     return _turn_envelope_result(
-        "build",
+        operation,
         payload=dict(payload),
         scheduler_execution_args=scheduler_execution_args,
         **({"captured_decision_path": captured_decision_path}
