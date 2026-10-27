@@ -1967,7 +1967,7 @@ export function turnEnvelopeRoute(envelope: JsonObject, historicalText?: JsonObj
         if (!(error instanceof EffectRuntimeRequestError)) throw error;
         return "contract_error";
       }
-      return route;
+      return "replan_required";
     }
     if (action.delivery_allowed !== true) return "blocked";
     if (route === "capability_action_required") {
@@ -1978,8 +1978,9 @@ export function turnEnvelopeRoute(envelope: JsonObject, historicalText?: JsonObj
       if (intent.schema_version !== "pending_capability_intent_projection_v0"
           || (intent.goal_id ?? null) !== (envelope.goal_id ?? null)
           || (intent.agent_id ?? null) !== (envelope.agent_id ?? null) || !hasCommand) return "contract_error";
+      return "capability_action_required";
     }
-    return route;
+    return route === "repair_required" ? "repair_required" : "ready_for_host";
   }
   if (object(envelope.user).action_required === true) return "user_action_required";
   return action.quiet_noop_allowed === true ? "wait" : "blocked";
