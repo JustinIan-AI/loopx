@@ -26,9 +26,8 @@ from ..collaboration.operation_handoff import (
 from ..goals.first_party_host_admission import FirstPartyHostGoalAdmission
 from ..effect_runtime import EffectRuntimeRejected
 from .codex_cli import (
-    _prompt,
     normalize_codex_stdio_mcp_server,
-    codex_cli_result_schema,
+    prepare_codex_cli_input,
 )
 from .codex_sessions import (
     _lineage,
@@ -475,8 +474,9 @@ def run_codex_operation_host(
             else:
                 goal_admission.accept_result(record_child)
 
+        input_text, result_schema = prepare_codex_cli_input(request)
         result = session.send(
-            _prompt(request)
+            input_text
             + "\nUse loopx_operation for context/pending/prepare/inspect/consume/report. "
             "Source conversations are not executor identity. context/pending/inspect do not require consumption. "
             "When the admitted task authorizes proposal preparation and supplies its terms, prepare may run before human confirmation or consume; "
@@ -490,7 +490,7 @@ def run_codex_operation_host(
                + json.dumps(continuations, sort_keys=True)
                + ". Inspect these locators through loopx_operation and consume once before any effect."
                if continuations else ""),
-            output_schema=codex_cli_result_schema(request),
+            output_schema=result_schema,
             on_event=on_event,
             turn_start_guard=lambda: launch_scope("codex_operation_turn_start"),
             **({"on_native_item": observe_child} if child_observer is not None else {}),
