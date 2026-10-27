@@ -118,6 +118,24 @@ different questions; their proximity is not proof they should be one state.
   benefit experiments. Replace real consumers in the delivery slice; preserve
   historical decoding and original effect readback across code rollback.
 
+**Source proposal (2026-10-28).** The existing Effect runtime now composes
+journal receipt qualification and ordered continuation in the typed Turn owner.
+`managed_step.py` sends one complete journal/decision request instead of rebuilding
+an execution payload; the driver uses the same route classifier. The registered
+ordered contract, historical journal decoder and independent recovery decision
+remain. Public Python receipt/budget value objects keep their API, including exact
+integer transport. Native File/SQLite retry, saved-result replay and lost-spend
+response tests retain the original Turn and one debit. Rule mutations exercise
+the actual TS evaluator. This is a single-session source proposal, not C1 cutover,
+C4.2/C4.3 adoption, installed qualification or long-horizon benefit. Reconcile
+original receipts before rollback; no journal or settlement schema changes.
+The same inventory measures 43 maintained Python/TS pairs on the base and 45 on
+this proposal: the new controller and host-failure pairs retain the Python API
+and native failure producer while sharing TS decisions. The pair budget records
+that maintenance cost (43 → 45); generated exclusions and the over-budget
+negative check remain. Deleted Python decisions, rather than the pair count,
+establish convergence. Added bridge traffic is disclosed without a speedup claim.
+
 ## C4.2 — Thin outer-worker semantic adoption
 
 **Candidate for bounded policy convergence.**
