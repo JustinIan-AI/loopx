@@ -789,6 +789,15 @@ CKPT_GUEST_NODE=/absolute/path/to/node
   --output "$CKPT_PROVIDER_ROOT/joint-result"
 ```
 
+Pass `--context-delivery on` with a supported native hook host (Codex CLI
+`0.162.1`) to qualify the opt-in transport in the same joint path. The source
+must actually deliver a complete full packet and later deltas across worker
+wakes; every fresh receiver must begin with a complete current full packet.
+The static inference follows model-visible page cursors, and a separate byte-map
+oracle checks complete delivery and retained delta bases before candidate work.
+The default remains `off`. Neither mode measures paid inference, task quality or
+fees; reusing a point still does not count its source test as passed in this run.
+
 The public fixture runs six actual native work wakes, captures the pending
 pre-decision guard and continues the source; the ordinary and stride receivers
 then use separate fresh guests with no mounted source authority. It includes a
