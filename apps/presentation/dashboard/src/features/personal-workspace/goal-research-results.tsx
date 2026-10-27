@@ -39,7 +39,12 @@ export function GoalResearchResults({goalId, api, zh, hideEmpty = false}: {goalI
     return () => {current = false;};
   }, [goalId, api.indexUrl, api.detailUrl, revision]);
 
-  if (hideEmpty && !busy && !error && !results.length) return null;
+  // The research index is an optional extension. A missing index (404/410)
+  // means "no published research for this Goal", not a read failure; old
+  // content in that state is simply empty rather than an HTML error string.
+  const indexMissing = error.includes("HTTP 404") || error.includes("HTTP 410");
+
+  if (hideEmpty && !busy && !results.length && (indexMissing || !error)) return null;
   return <section className="goal-team-results goal-research-results min-w-0 [overflow-wrap:anywhere]"
     aria-label={zh ? "研究成果" : "Research results"} aria-busy={busy}>
     <header><div><h3>{zh ? "研究成果" : "Research results"}</h3></div>
@@ -47,7 +52,7 @@ export function GoalResearchResults({goalId, api, zh, hideEmpty = false}: {goalI
         <RefreshCw size={14} aria-hidden="true"/>{zh ? "刷新" : "Refresh"}
       </button></header>
     {busy ? <p role="status">{zh ? "正在核验研究结果…" : "Verifying research results…"}</p> : null}
-    {error ? <p role="alert">{zh ? "无法核验研究结果；旧内容已清除。" : "Cannot verify research results; previous content was cleared."} {error}</p> : null}
+    {error && !indexMissing ? <p role="alert">{zh ? "无法核验研究结果；旧内容已清除。" : "Cannot verify research results; previous content was cleared."} {error}</p> : null}
     {!busy && !error && !results.length ? <p>{zh ? "本 Goal 暂无可读取的公开研究成果。" : "No readable public research results for this Goal yet."}</p> : null}
     {results.map(result => <DecisionResearchSurface key={`${result.surface.extension_id}:${result.surface.surface_id}`}
       goals={api.goals} surface={result.surface} view={result.projection?.view}
