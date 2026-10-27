@@ -190,6 +190,8 @@ export function GoalVitals({ goal, items, onFocusRegion, userTodos, digest: shar
 
   const windowLabel = digest.usage.window === "7d" ? t("vitals.window7d") : digest.usage.window === "24h" ? t("vitals.window24h") : t("vitals.notMeasured");
   const needs = digest.needsYou;
+  const needsEmpty = needs.availability === "ok" && needs.coverage === "complete"
+    && needs.blocking === 0 && needs.optional === 0;
   const last = digest.lastActivity;
   const lastTime = last ? relativeTime(last.at, locale) : null;
   const stateLabel = finishing ? t("vitals.stopping") : t(activity.labelKey as WorkspaceMessageKey);
@@ -215,14 +217,14 @@ export function GoalVitals({ goal, items, onFocusRegion, userTodos, digest: shar
         </>}>
         {work.total === null ? work.open : <span>{work.done}<small>/{work.total}</small></span>}
       </Vital>
-      <Vital label={t("vitals.needsYou")} empty={needs.availability === "ok" && needs.blocking === null} onClick={() => onFocusRegion("attention")} valueKey={`${goal.goalId}:${needs.availability}:${needs.availability === "ok" ? needs.blocking : ""}`}
+      <Vital label={t("vitals.needsYou")} empty={needsEmpty} onClick={() => onFocusRegion("attention")} valueKey={`${goal.goalId}:${needs.availability}:${needs.availability === "ok" ? needs.blocking : ""}`}
         tone={needs.availability === "ok" && needs.blocking !== null && needs.blocking > 0 ? "danger" : needs.availability === "ok" ? "recede" : undefined}
         help={needs.availability !== "ok" || needs.coverage !== "complete" ? <ContextHelp icon={CircleHelp} label={`${t("vitals.needsYou")} · ${needs.availability !== "ok" ? t("vitals.unavailable") : (locale === "zh-CN" ? "部分记录" : "Partial records")}`}><p>{needs.availability === "ok" ? t("vitals.needsYouPartial", {count: needs.listed}) : t("vitals.unavailable")}</p></ContextHelp> : undefined}
         sub={needs.availability !== "ok" ? null : [
           needs.oldestWaitingSince ? t("vitals.needsYouOldest", { time: relativeTime(needs.oldestWaitingSince, locale) ?? "" }) : null,
           needs.optional ? t("vitals.needsYouOptional", { count: needs.optional }) : null,
         ].filter(Boolean).join(" · ")}>
-        {needs.availability !== "ok" ? t("vitals.unavailable") : needs.blocking === null ? t("vitals.needsYouNone")
+        {needs.availability !== "ok" ? t("vitals.unavailable") : needs.blocking === null ? "—" : needsEmpty ? t("vitals.needsYouNone")
           : <>{needs.blocking > 0 ? <AlertCircle aria-hidden size={15} /> : null}{needs.blocking}</>}
       </Vital>
       <Vital label={t("vitals.agentTime")} onClick={() => onFocusRegion("usage")} sub={digest.usage.agentTimeMs === null ? undefined : windowLabel}
