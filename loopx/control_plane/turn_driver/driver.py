@@ -1,5 +1,8 @@
 from __future__ import annotations
-from .turn_contract_generated import LoopXTurnRoute  # compatibility re-export
+from .turn_contract_generated import (
+    LoopXTurnRoute,  # compatibility re-export
+    TURN_CONTROLLER_CONTRACT,
+)
 from ..quota.effective_action import EffectiveAction
 
 import json
@@ -53,62 +56,13 @@ def session_identity_fields(scope: str) -> tuple[str, ...]:
     return ("goal_id", "agent_id")
 
 
-REPLAN_ACTIONS = {
-    "autonomous_replan",
-    "autonomous_replan_required",
-    "successor_replan_required",
-}
-REPAIR_ACTIONS: frozenset[EffectiveAction] = frozenset(
-    {
-        EffectiveAction.AGENT_WORKSPACE_REPAIR,
-        EffectiveAction.BOUNDARY_PROJECTION_REPAIR,
-        EffectiveAction.CAPABILITY_BRIDGE_REPAIR,
-        EffectiveAction.CONTROL_PLANE_HEALTH_REPAIR,
-        EffectiveAction.CONTROL_PLANE_PROJECTION_REPAIR,
-        EffectiveAction.CONTROL_PLANE_REPAIR,
-        EffectiveAction.RUNTIME_USER_GATE_PROJECTION_REPAIR,
-        EffectiveAction.STATE_PROJECTION_GAP_REPAIR,
-        EffectiveAction.TODO_DECISION_SCOPE_PROJECTION_REPAIR,
-    }
-)
-# Registered actions that run on a Host. The root should-run/Envelope slot is a
-# disjoint union of the decision vocabulary and the frontier vocabulary, and
-# every value either owner can carry is classified: replan above, repair above,
-# capability intent in its own branch, and the rest named here. Host execution
-# is therefore a stated classification rather than the absence of a branch, so
-# a newly registered action cannot inherit it silently -- the accompanying test
-# fails until the new value is classified deliberately.
-HOST_EXECUTION_ACTIONS: frozenset[str] = frozenset(
-    {
-        # Decision vocabulary.
-        EffectiveAction.AGENT_MONITOR_ONLY.value,
-        EffectiveAction.AUTOMATION_PROMPT_UPGRADE_REQUIRED.value,
-        EffectiveAction.BLOCKED_HEALTH.value,
-        EffectiveAction.BLOCKED_WAIT.value,
-        EffectiveAction.COORDINATE_TASK_BUNDLE.value,
-        EffectiveAction.EXTERNAL_EVIDENCE_OBSERVE.value,
-        EffectiveAction.HEARTBEAT_RECEIPT_WRITE_FAILED.value,
-        EffectiveAction.HEARTBEAT_SETTLED_SKIP.value,
-        EffectiveAction.LARK_INBOX_REPLY_DUE.value,
-        EffectiveAction.MONITOR_DUE.value,
-        EffectiveAction.MONITOR_QUIET_SKIP.value,
-        EffectiveAction.NORMAL_RUN.value,
-        EffectiveAction.OPERATOR_GATE_NOTIFY.value,
-        EffectiveAction.OPERATOR_INBOX_MATERIAL_REVIEW_DUE.value,
-        EffectiveAction.OUTCOME_FLOOR_RECOVERY.value,
-        EffectiveAction.PEER_COORDINATION_BLOCKED.value,
-        EffectiveAction.QUOTA_SKIP.value,
-        EffectiveAction.SCOPED_USER_GATE_FALLBACK.value,
-        EffectiveAction.TERMINAL_NO_FOLLOWUP.value,
-        EffectiveAction.THROTTLED_SKIP.value,
-        EffectiveAction.UNSETTLED_HOST_TURN_RECOVERY.value,
-        # Frontier vocabulary. These are not EffectiveAction members, so they
-        # are named by value rather than through the enum.
-        "agent_scope_exhausted",
-        "agent_scope_wait",
-        "reassignment_required",
-    }
-)
+# Public classification sets are projections of the same registered contract
+# used by the typed route owner, not a second admission table.
+REPLAN_ACTIONS = frozenset(TURN_CONTROLLER_CONTRACT["route_admission"]["replan_actions"])
+REPAIR_ACTIONS = frozenset(EffectiveAction(value) for value in
+    TURN_CONTROLLER_CONTRACT["route_admission"]["repair_actions"])
+HOST_EXECUTION_ACTIONS = frozenset(
+    TURN_CONTROLLER_CONTRACT["route_admission"]["host_execution_actions"])
 
 
 def unregistered_route(effective_action: str) -> LoopXTurnRoute:
@@ -138,64 +92,9 @@ def _mapping(value: Any) -> dict[str, Any]:
 
 
 def _typed_route(envelope: Mapping[str, Any]) -> LoopXTurnRoute:
-    signature = _mapping(envelope.get("action_signature"))
-    source_hash = str(signature.get("source_hash") or "")
-    envelope_hash = str(signature.get("envelope_hash") or "")
-    if (
-        signature.get("matches") is not True
-        or not source_hash
-        or source_hash != envelope_hash
-    ):
-        return LoopXTurnRoute.CONTRACT_ERROR
-    # Packet size is a performance warning, not execution authority. Keep the
-    # diagnostics in the envelope; schema/signature/lineage remain hard gates.
+    from .loop_controller import _controller_result
 
-    action = _mapping(envelope.get("action"))
-    user = _mapping(envelope.get("user"))
-    should_run = envelope.get("should_run") is True
-    effective_action = str(envelope.get("effective_action") or "")
-    delivery_allowed = action.get("delivery_allowed") is True
-    must_attempt = action.get("must_attempt") is True
-
-    if should_run:
-        if not must_attempt:
-            return LoopXTurnRoute.BLOCKED
-        # A semantic replan forbids ordinary delivery while requiring the Host
-        # to produce its bound planning outcome. Keep that route distinct from
-        # admission to execute the selected work.
-        if effective_action in REPLAN_ACTIONS:
-            try:
-                # Preserve the typed owner's signed Todo-less binding check.
-                # The plan's lineage gate still holds unbound replans; selected
-                # Todo replans retain their existing Task settlement identity.
-                turn_envelope_replan_settlement_identity(envelope, turn_instance_id=None)
-            except (ValueError, RuntimeError):
-                return LoopXTurnRoute.CONTRACT_ERROR
-            return LoopXTurnRoute.REPLAN_REQUIRED
-        if not delivery_allowed:
-            return LoopXTurnRoute.BLOCKED
-        try:
-            registered_action = EffectiveAction(effective_action)
-        except ValueError:
-            registered_action = None
-        if registered_action is EffectiveAction.GOVERNED_CAPABILITY_INTENT:
-            intent = _mapping(action.get("capability_intent"))
-            if (intent.get("schema_version") != "pending_capability_intent_projection_v0"
-                or intent.get("goal_id") != envelope.get("goal_id")
-                or intent.get("agent_id") != envelope.get("agent_id")
-                or not intent.get("command")):
-                return LoopXTurnRoute.CONTRACT_ERROR
-            return LoopXTurnRoute.CAPABILITY_ACTION_REQUIRED
-        if registered_action in REPAIR_ACTIONS:
-            return LoopXTurnRoute.REPAIR_REQUIRED
-        if effective_action in HOST_EXECUTION_ACTIONS:
-            return LoopXTurnRoute.READY_FOR_HOST
-        return unregistered_route(effective_action)
-    if user.get("action_required") is True:
-        return LoopXTurnRoute.USER_ACTION_REQUIRED
-    if action.get("quiet_noop_allowed") is True:
-        return LoopXTurnRoute.WAIT
-    return LoopXTurnRoute.BLOCKED
+    return LoopXTurnRoute(_controller_result("route", decision=dict(envelope))["route"])
 
 
 def selected_turn_todo(envelope: Mapping[str, Any]) -> dict[str, Any]:

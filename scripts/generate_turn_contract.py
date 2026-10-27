@@ -84,6 +84,7 @@ def validate_contract(contract):
             "route_projection",
             "rules",
             "vocabularies",
+            "route_admission",
         },
         "unsupported fields",
     )
@@ -99,6 +100,17 @@ def validate_contract(contract):
         set(contract["vocabularies"]) == {name for name, _, _ in SETS},
         "three distinct vocabularies required",
     )
+    admission = contract["route_admission"]
+    require(set(admission) == {"replan_actions", "repair_actions", "host_execution_actions"},
+            "unsupported route admission groups")
+    require(all(isinstance(values, list) and values
+                and all(isinstance(value, str) and value for value in values)
+                and len(values) == len(set(values)) for values in admission.values()),
+            "route admission requires distinct nonempty action names")
+    require(not (set(admission["replan_actions"]) & set(admission["repair_actions"])
+                 or set(admission["host_execution_actions"]) &
+                 (set(admission["replan_actions"]) | set(admission["repair_actions"]))),
+            "route admission groups overlap")
     domains = {}
     for name, _, _ in SETS:
         members = contract["vocabularies"][name]
