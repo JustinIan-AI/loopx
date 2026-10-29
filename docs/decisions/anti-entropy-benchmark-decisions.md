@@ -27,9 +27,9 @@ LoopX possesses an existing deterministic AST-based anti-entropy engine (`loopx/
 - **Considered Alternatives**:
   - *Option 1*: Pure prompt guidance (soft constraint). Zero tooling overhead, but models consistently regress under multi-file pressure.
   - *Option 2*: Post-hoc terminal gate only. Verifies diff at submission; fails late when the agent has already exhausted budget, leading to blind rollback loops.
-  - *Option 3 (Selected)*: **Two-Tier Closed Loop (Execution Tool + Submission Gate)**.
-    - Exposes `anti_entropy_inspect` as an advisory tool during execution so the agent can self-audit diff cleanliness.
-    - Chains `loopx anti-entropy verify` into the delivery evaluation command, failing the run if `AntiEntropyReceipt.verdict != "passed"`.
+  - *Option 3 (Selected, partially delivered)*: **Two-Tier Closed Loop (Execution Tool + Submission Gate)**.
+    - Delivered now: the execution tier as an explicitly callable entry (`anti_entropy_inspect` tool descriptor plus `loopx anti-entropy inspect`) returning actionable progress-fact feedback, and the gate tier as a named delivery route — final blocking stays owned by the existing change-quality `prepare/record/verify` receipt, not a parallel authority.
+    - Not yet proven: that models actually adopt the tool and prefer deletion in long-horizon runs. That claim requires actual recorded runs and is intentionally not asserted by this ADR or the comparator.
 - **Trade-off**: Increases tool-call rounds and slight token overhead per run, in exchange for deterministic first-pass cleanliness and eliminating expensive blind rollbacks.
 
 ---
@@ -40,7 +40,8 @@ LoopX possesses an existing deterministic AST-based anti-entropy engine (`loopx/
   - *Option 2*: Dynamic runtime AST inference without declaration. Prone to false positives when agents refactor internal helper functions.
   - *Option 3 (Selected)*: **Declarative Sidecar / Task-Envelope Hook Pattern**.
     - The task specification explicitly provides an `anti_entropy_basis` (target symbols and target paths to retire).
-    - The benchmark/test runner wraps the task externally: conditionally injects the inspect tool into the agent envelope and appends the verify CLI command to the test command.
+    - Delivered now: the typed turn-context projection (`build_anti_entropy_turn_context`) a host can inject when the capability is enabled for the task, and the explicit CLI/tool entries agents call.
+    - Named follow-up (not delivered here): a runner that conditionally injects the inspect tool into a host agent envelope and appends the verify command to a test command. Owner: the host integration that owns agent envelopes; post-writeback typed intent stays with the provider-neutral post-writeback capability-hooks RFC, including failure isolation and idempotence.
     - `loopx/control_plane/` remains completely unmodified (0-line diff).
 - **Trade-off**: Requires test cases to declare their target retirement list in advance, rather than inferring intent magically.
 
@@ -53,7 +54,7 @@ LoopX possesses an existing deterministic AST-based anti-entropy engine (`loopx/
   - *Option 3 (Selected)*: **Self-Contained Realistic Engineering Playground in `examples/anti_entropy/`**.
     - A multi-module Python service (protocol parser + streaming receiver + client caller + unit test suite).
     - Real task: Migrate all callers from `LegacyProtocolParser` to `StreamMessageParser` and physically delete `legacy_parser.py`.
-    - Automated comparator evaluates Arm 1 (Baseline), Arm 2 (Prompt Only), and Arm 3 (Two-Tier Anti-Entropy).
+    - The comparator is a deterministic, fixed-input sandbox demonstration: per arm it seeds a disposable git sandbox, applies the fixed post-state, captures the real diff with git, executes the case-study functional tests with pytest, and evaluates the oracle against the bound sandbox workspace. It measures oracle semantics only — it launches no model runs and measures no agent-runtime behavior, so its output must not be read as an agent-effectiveness result.
 - **Trade-off**: Tests on a standalone engineering playground rather than mutating production LoopX code directly.
 
 ---
@@ -67,7 +68,16 @@ LoopX possesses an existing deterministic AST-based anti-entropy engine (`loopx/
 
 ---
 
-## 4. Impacted System Components & Retired Paths
+## 4. Delivered Boundary (This PR)
+
+- **Delivered**: default-off capability with explicit typed entries — `loopx anti-entropy verify` (delivery-gate semantics, exit 1 on rejection), `loopx anti-entropy inspect` (in-flight progress-fact feedback, exit 0), the `anti_entropy_inspect` tool descriptor registered in the capability catalog, the `build_anti_entropy_turn_context` projection, and the single-task feedback cycle classifying findings as actionable progress facts. Symbol retirement certification requires an explicitly bound workspace (`--workspace`); diff-only receipts may reject but never certify, and evidence provenance (`basis_hash`, `source_root`, `source_evidence`) is recorded on every receipt.
+- **Delivery authority**: unchanged and owned by change-quality (`prepare/record/verify`, exact diff scope, receipt invalidation). This capability supplies evidence and names the delivery route; it writes no delivery receipt.
+- **Not claimed**: model adoption of the loop in real agent runs, measured entropy reduction on live workloads, or any comparator-derived effectiveness number. Those require the recorded-run evaluation program (Decision 3) executed for real, and the envelope-injection runner from Decision 2.
+- **Source binding invariants**: complete post-change sources are AST-parsed; documentation files never contribute symbol evidence; string literals, comments, and docstring examples are never counted as references or definitions; a missing bound source is evidence-insufficient (AE004), never silently skipped.
+
+---
+
+## 5. Impacted System Components & Retired Paths
 
 - **Impacted Components**:
   - `docs/decisions/anti-entropy-benchmark-decisions.md`: Canonical ADR record.

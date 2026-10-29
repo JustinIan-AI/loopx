@@ -11,6 +11,11 @@ from .contract import (
     AntiEntropyReceipt,
     RetirementBasis,
 )
+from .feedback import (
+    ANTI_ENTROPY_INSPECT_TOOL_DESCRIPTOR,
+    build_anti_entropy_turn_context,
+    run_anti_entropy_feedback_cycle,
+)
 from .oracles import (
     audit_ghost_code,
     evaluate_diff_hygiene,
@@ -20,6 +25,7 @@ from .oracles import (
 __all__ = [
     "ANTI_ENTROPY_CAPABILITY_ID",
     "ANTI_ENTROPY_CATALOG_ENTRY",
+    "ANTI_ENTROPY_INSPECT_TOOL_DESCRIPTOR",
     "ANTI_ENTROPY_RECEIPT_SCHEMA_VERSION",
     "ANTI_ENTROPY_RETIREMENT_BASIS_SCHEMA_VERSION",
     "AntiEntropyFinding",
@@ -27,7 +33,9 @@ __all__ = [
     "RetirementBasis",
     "anti_entropy_inspect",
     "audit_ghost_code",
+    "build_anti_entropy_turn_context",
     "evaluate_diff_hygiene",
+    "run_anti_entropy_feedback_cycle",
     "run_anti_entropy_verify",
     "verify_delete_first",
 ]

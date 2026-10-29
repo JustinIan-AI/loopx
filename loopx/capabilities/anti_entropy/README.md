@@ -17,10 +17,13 @@ The Anti-Entropy capability addresses this through:
 1. **AST-Based Delete-First Enforcement (`verify_delete_first`)**:
    Uses Python's syntax tree parser to verify that declared retirement targets
    (functions and classes) are genuinely removed from the codebase rather than
-   merely bypassed or wrapped.
+   merely bypassed or wrapped. Symbol retirement is a derived fact about
+   **complete post-change sources**, not about diff text alone.
 2. **Zombie Symbol Prevention**:
    Detects if a symbol marked for retirement is reintroduced as a new definition
-   in newly added code lines.
+   in the diff, or is still referenced by active identifiers in the bound
+   post-change sources (string literals, comments, and docstring examples are
+   never counted as references).
 3. **Target Paths Verification**:
    Ensures that declared legacy file paths slated for deletion are completely
    removed in the unified diff (`/dev/null`).
@@ -29,7 +32,54 @@ The Anti-Entropy capability addresses this through:
    quality findings without blocking legitimate documentation or explanatory comments.
 5. **Durable Receipt Generation (`AntiEntropyReceipt`)**:
    Runs deterministic hygiene oracles against the exact git diff and produces
-   an immutable receipt recording verified retired symbols and findings.
+   an immutable receipt recording verified retired symbols, findings, and the
+   evidence provenance (`basis_hash`, `source_root`, `source_evidence`).
+
+## Source Binding And Evidence Rules
+
+Verification distinguishes diff-visible facts from workspace-derived facts:
+
+- `--workspace <dir>` explicitly binds the directory holding the complete
+  post-change sources. The bound workspace — never the caller's CWD — is the
+  only disk source read, and its complete files are parsed with the AST
+  (line-signature matching is limited to unparseable in-diff code fragments;
+  documentation files never contribute symbol evidence).
+- **AE004 (insufficient source evidence, blocking)**: without a bound
+  workspace, or when a diff-touched source file is missing from the bound
+  workspace, symbol retirement cannot be certified. A diff-only receipt may
+  reject, but never certifies retirement, and `retired_symbols` stays empty.
+  A path deleted in the diff but still present in the bound workspace is
+  reported as a patch/workspace mismatch.
+- **AE001/AE002 remain hard gates** in this command; **AE003 stays advisory**.
+  `allow_compat_seam=true` turns a retained-but-authorized definition into an
+  advisory finding, and it is never listed as retired.
+- The receipt records which sources backed the verdict; a `diff_hash` alone
+  does not prove anything about the task, the sources, or the policy.
+
+## Single-Task Feedback Loop (Default-Off)
+
+The capability ships disabled (`default_enabled: false`); enabling it for a
+task is an explicit choice. When enabled, one closed loop per task is:
+
+1. **Task context** — `build_anti_entropy_turn_context(basis, goal_id,
+   workspace)` projects the declared `RetirementBasis` into a typed
+   turn-context payload a host can inject into agent input. Building the
+   payload executes nothing.
+2. **In-flight check** — agents call the `anti_entropy_inspect` tool (or
+   `loopx anti-entropy inspect`). Blocking findings come back as
+   **actionable feedback with per-rule next actions**, classified as progress
+   facts, not final delivery failures; the CLI exits 0 whenever the check ran.
+3. **Delivery verification** — final acceptance stays owned by the existing
+   change-quality owner (`loopx change-quality prepare/record/verify`, exact
+   diff scope and receipt invalidation). This capability supplies evidence and
+   names the delivery route; it writes no receipt store and creates no
+   parallel delivery authority.
+4. **Post-writeback (named follow-up)** — typed post-writeback intent bound to
+   the source receipt remains owned by the provider-neutral post-writeback
+   capability-hooks RFC, including failure isolation and idempotence.
+
+Model adoption of the loop is proven by actual runs, not by this protocol;
+tests here cover the typed protocol and the real callable entries.
 
 ## Attribution & Acknowledgments
 
@@ -45,10 +95,16 @@ Inspect the capability and its registered protocols:
 loopx capability show anti-entropy-governance --format json
 ```
 
-Verify diff hygiene against a declared retirement basis:
+In-flight inspection with actionable feedback (progress-fact semantics):
 
 ```bash
-loopx anti-entropy verify --goal-id <goal-id> --diff-file <diff.patch> --basis-json <basis.json> --format json
+loopx anti-entropy inspect --goal-id <goal-id> --diff-file <diff.patch> --basis-json <basis.json> --workspace <sources> --format json
+```
+
+Delivery-gate verification (non-zero exit on rejection):
+
+```bash
+loopx anti-entropy verify --goal-id <goal-id> --diff-file <diff.patch> --basis-json <basis.json> --workspace <sources> --format json
 ```
 
 Example `basis.json`:
@@ -62,10 +118,19 @@ Example `basis.json`:
 }
 ```
 
+A deterministic end-to-end demonstration on fixed fixtures lives in
+`examples/anti_entropy/compare_arms.py`: it seeds a disposable git sandbox per
+arm, applies the arm's fixed post-state, captures the real diff with git, runs
+the case-study functional tests with pytest, and evaluates the oracle against
+the sandbox workspace. It measures the oracle's semantics only — it launches
+no model runs and measures no agent-runtime behavior.
+
 ## Boundaries
 
 - The capability is default-off and operates as an opt-in code hygiene verifier via CLI and typed receipts.
 - Delete-first requires target old logic to be cleanly decommissioned in the diff without re-introducing wrappers or zombie symbols.
+- Symbol retirement certification requires an explicitly bound workspace; diff-only evidence can reject but never certifies.
 - AST-based diff hygiene verifies exact code diffs without mutating repository code or performing speculative git writes.
 - Target paths declared for decommissioning must be cleanly removed in the unified diff.
 - Advisory findings highlight non-blocking hygiene opportunities (such as dead commented code) without causing false positive rejections of documentation or explanations.
+- Delivery acceptance and receipts of record remain owned by the change-quality capability; this capability never writes delivery receipts.

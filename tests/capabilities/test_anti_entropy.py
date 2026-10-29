@@ -1,14 +1,12 @@
 from __future__ import annotations
 
-import json
-from typing import Any
+from pathlib import Path
 
 from loopx.capabilities.anti_entropy import (
     ANTI_ENTROPY_CAPABILITY_ID,
     ANTI_ENTROPY_CATALOG_ENTRY,
     ANTI_ENTROPY_RECEIPT_SCHEMA_VERSION,
     ANTI_ENTROPY_RETIREMENT_BASIS_SCHEMA_VERSION,
-    AntiEntropyReceipt,
     RetirementBasis,
     audit_ghost_code,
     evaluate_diff_hygiene,
@@ -31,8 +29,18 @@ def test_catalog_registration() -> None:
     assert "delete-first" in record["real_world_anchor"] or "refactoring" in record["real_world_anchor"]
 
 
-def test_verify_delete_first_passed() -> None:
-    """Verify clean retirement where old symbol is cleanly deleted."""
+def _make_workspace(tmp_path: Path, files: dict[str, str]) -> Path:
+    """Create an explicitly bound workspace containing post-change sources."""
+    workspace = tmp_path / "workspace"
+    for rel_path, content in files.items():
+        target = workspace / rel_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+    return workspace
+
+
+def test_verify_delete_first_passed(tmp_path: Path) -> None:
+    """Verify clean retirement where old symbol is cleanly deleted from bound sources."""
     diff = """
 --- a/legacy_module.py
 +++ b/legacy_module.py
@@ -42,19 +50,23 @@ def test_verify_delete_first_passed() -> None:
 +def modern_calculator(x: int, y: int) -> int:
 +    return x + y
 """
+    workspace = _make_workspace(
+        tmp_path,
+        {"legacy_module.py": "def modern_calculator(x: int, y: int) -> int:\n    return x + y\n"},
+    )
     basis = RetirementBasis(
         target_symbols=("old_deprecated_calculator",),
         rationale="Replaced by modern_calculator",
     )
-    findings = verify_delete_first(diff, basis)
+    findings = verify_delete_first(diff, basis, workspace=workspace)
     assert len(findings) == 0
 
-    receipt = evaluate_diff_hygiene(diff, basis)
+    receipt = evaluate_diff_hygiene(diff, basis, workspace=workspace)
     assert receipt.verdict == "passed"
     assert "old_deprecated_calculator" in receipt.retired_symbols
 
 
-def test_verify_delete_first_violation() -> None:
+def test_verify_delete_first_violation(tmp_path: Path) -> None:
     """Verify rejection when old symbol is kept instead of delete-first."""
     diff = """
 --- a/legacy_module.py
@@ -65,21 +77,32 @@ def test_verify_delete_first_violation() -> None:
  def old_deprecated_calculator(x, y):
      return x + y
 """
+    workspace = _make_workspace(
+        tmp_path,
+        {
+            "legacy_module.py": (
+                "def modern_calculator(x: int, y: int) -> int:\n"
+                "    return x + y\n"
+                "def old_deprecated_calculator(x, y):\n"
+                "    return x + y\n"
+            )
+        },
+    )
     basis = RetirementBasis(
         target_symbols=("old_deprecated_calculator",),
         allow_compat_seam=False,
     )
-    findings = verify_delete_first(diff, basis)
+    findings = verify_delete_first(diff, basis, workspace=workspace)
     assert len(findings) == 1
     assert findings[0].rule_id == "AE001-DELETE_FIRST_VIOLATION"
     assert findings[0].severity == "blocking"
 
-    receipt = evaluate_diff_hygiene(diff, basis)
+    receipt = evaluate_diff_hygiene(diff, basis, workspace=workspace)
     assert receipt.verdict == "rejected"
 
 
 def test_verify_delete_first_zombie_reintroduced() -> None:
-    """Verify rejection when symbol is deleted and reintroduced simultaneously."""
+    """Verify rejection when symbol is deleted and reintroduced simultaneously in the diff."""
     diff = """
 --- a/legacy_module.py
 +++ b/legacy_module.py
@@ -95,7 +118,7 @@ def test_verify_delete_first_zombie_reintroduced() -> None:
 
 def test_target_paths_deletion() -> None:
     """Verify target_paths require complete file deletion headers in the diff."""
-    # File cleanly deleted -> pass
+    # File cleanly deleted -> pass (diff-only evidence is sufficient for paths)
     deleted_diff = """
 --- a/legacy/old_file.py
 +++ /dev/null
@@ -122,7 +145,7 @@ def test_target_paths_deletion() -> None:
     assert any(f.rule_id == "AE001-DELETE_FIRST_VIOLATION" for f in receipt_partial.findings)
 
 
-def test_compat_seam_does_not_falsely_retire() -> None:
+def test_compat_seam_does_not_falsely_retire(tmp_path: Path) -> None:
     """Verify allow_compat_seam allows passing but does NOT claim un-deleted symbols as retired."""
     diff = """
 --- a/legacy_module.py
@@ -132,14 +155,37 @@ def test_compat_seam_does_not_falsely_retire() -> None:
  def old_api():
      return 1
 """
+    workspace = _make_workspace(tmp_path, {"legacy_module.py": "def old_api():\n    return 1\n"})
     basis = RetirementBasis(
         target_symbols=("old_api",),
         allow_compat_seam=True,
     )
-    receipt = evaluate_diff_hygiene(diff, basis)
+    receipt = evaluate_diff_hygiene(diff, basis, workspace=workspace)
     assert receipt.verdict == "passed"
+    seam_findings = [f for f in receipt.findings if f.location == "old_api"]
+    assert seam_findings and all(f.severity == "advisory" for f in seam_findings)
     # old_api was NOT deleted, so it must NOT be in retired_symbols!
     assert "old_api" not in receipt.retired_symbols
+
+
+def test_retained_definition_is_blocking_without_compat_seam(tmp_path: Path) -> None:
+    """A retained definition without an authorized compat seam stays a hard AE001 block."""
+    diff = """
+--- a/legacy_module.py
++++ b/legacy_module.py
+@@ -1,3 +1,4 @@
++# some edit
+ def old_api():
+     return 1
+"""
+    workspace = _make_workspace(tmp_path, {"legacy_module.py": "def old_api():\n    return 1\n"})
+    basis = RetirementBasis(target_symbols=("old_api",), allow_compat_seam=False)
+    receipt = evaluate_diff_hygiene(diff, basis, workspace=workspace)
+    assert receipt.verdict == "rejected"
+    assert any(
+        f.rule_id == "AE001-DELETE_FIRST_VIOLATION" and f.severity == "blocking"
+        for f in receipt.findings
+    )
 
 
 def test_false_positive_prevention() -> None:
@@ -177,7 +223,7 @@ def test_audit_ghost_code_commented_block() -> None:
     assert findings[0].severity == "advisory"
 
 
-def test_cli_runner() -> None:
+def test_cli_runner(tmp_path: Path) -> None:
     """Verify CLI verify function generates a complete, valid payload."""
     clean_diff = """
 --- a/service.py
@@ -187,15 +233,18 @@ def test_cli_runner() -> None:
 +def modern_call():
      return 42
 """
+    workspace = _make_workspace(tmp_path, {"service.py": "def modern_call():\n    return 42\n"})
     payload = run_anti_entropy_verify(
         diff_text=clean_diff,
         basis_data={"target_symbols": ["legacy_call"]},
         goal_id="test-goal-id",
+        workspace=workspace,
     )
     assert payload["ok"] is True
     assert payload["verdict"] == "passed"
     assert payload["blocking_finding_count"] == 0
     assert "legacy_call" in payload["retired_symbols"]
+
 
 def test_retirement_basis_type_validation() -> None:
     """Verify strict type validation on RetirementBasis.from_dict to prevent truthiness loopholes."""
@@ -240,12 +289,17 @@ def test_retirement_basis_type_validation() -> None:
         RetirementBasis.from_dict({"rationale": 123})
 
 
-def test_cli_exit_code_and_subprocess() -> None:
+def test_cli_exit_code_and_subprocess(tmp_path: Path) -> None:
     """Verify CLI returns exit code 1 on rejection, 0 on pass, and 2 on invalid basis JSON."""
     import subprocess
     import sys
 
-    # 1. Rejected verification -> exit code 1
+    workspace = _make_workspace(
+        tmp_path,
+        {"service.py": "def old_api():\n    return 1\n"},
+    )
+
+    # 1. Rejected verification (definition retained in bound workspace) -> exit code 1
     diff_fail = """
 --- a/service.py
 +++ b/service.py
@@ -265,6 +319,8 @@ def test_cli_exit_code_and_subprocess() -> None:
             "-",
             "--basis-json",
             "{\"target_symbols\": [\"old_api\"]}",
+            "--workspace",
+            str(workspace),
             "--format",
             "json",
         ],
@@ -274,6 +330,7 @@ def test_cli_exit_code_and_subprocess() -> None:
     assert proc_fail.returncode == 1
 
     # 2. Passed verification -> exit code 0
+    clean_workspace = _make_workspace(tmp_path / "clean", {"service.py": "def new_api():\n    return 2\n"})
     diff_pass = """
 --- a/service.py
 +++ b/service.py
@@ -294,6 +351,8 @@ def test_cli_exit_code_and_subprocess() -> None:
             "-",
             "--basis-json",
             "{\"target_symbols\": [\"old_api\"]}",
+            "--workspace",
+            str(clean_workspace),
             "--format",
             "json",
         ],
@@ -322,8 +381,30 @@ def test_cli_exit_code_and_subprocess() -> None:
     )
     assert proc_err.returncode == 2
 
+    # 4. Nonexistent workspace directory -> exit code 2
+    proc_ws = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "loopx.cli",
+            "anti-entropy",
+            "verify",
+            "--diff-file",
+            "-",
+            "--basis-json",
+            "{\"target_symbols\": [\"old_api\"]}",
+            "--workspace",
+            str(tmp_path / "does_not_exist"),
+            "--format",
+            "json",
+        ],
+        input=diff_pass.encode("utf-8"),
+        capture_output=True,
+    )
+    assert proc_ws.returncode == 2
 
-def test_docstring_example_deletion_does_not_retire_real_definition() -> None:
+
+def test_docstring_example_deletion_does_not_retire_real_definition(tmp_path: Path) -> None:
     """Verify deleting a code example in a docstring does not falsely pass a retained real definition."""
     diff = (
         "--- a/api.py\n"
@@ -337,8 +418,12 @@ def test_docstring_example_deletion_does_not_retire_real_definition() -> None:
         " def old_api():\n"
         "     return 2\n"
     )
+    workspace = _make_workspace(
+        tmp_path,
+        {"api.py": '"""\nExample:\n    def old_api():\n        return 1\n"""\n\ndef old_api():\n    return 2\n'},
+    )
     basis = RetirementBasis(target_symbols=("old_api",))
-    receipt = evaluate_diff_hygiene(diff, basis)
+    receipt = evaluate_diff_hygiene(diff, basis, workspace=workspace)
     assert receipt.verdict == "rejected"
     assert any(f.rule_id in ("AE001-DELETE_FIRST_VIOLATION", "AE002-ZOMBIE_SYMBOL_REINTRODUCED") for f in receipt.findings)
     assert "old_api" not in receipt.retired_symbols
@@ -382,7 +467,7 @@ deleted file mode 100644
     assert len(receipt_quoted.findings) == 0
 
 
-def test_reintroduced_symbol_excluded_from_retired_symbols_with_partial_retirement() -> None:
+def test_reintroduced_symbol_excluded_from_retired_symbols_with_partial_retirement(tmp_path: Path) -> None:
     """Verify modified/reintroduced symbol is excluded from retired_symbols while cleanly retired symbol is kept."""
     diff = """
 --- a/service.py
@@ -395,15 +480,16 @@ def test_reintroduced_symbol_excluded_from_retired_symbols_with_partial_retireme
 +def old_api(x=1):
 +    return x
 """
+    workspace = _make_workspace(tmp_path, {"service.py": "def old_api(x=1):\n    return x\n"})
     basis = RetirementBasis(target_symbols=("old_helper", "old_api"))
-    receipt = evaluate_diff_hygiene(diff, basis)
+    receipt = evaluate_diff_hygiene(diff, basis, workspace=workspace)
     assert receipt.verdict == "rejected"
     assert any(f.rule_id == "AE002-ZOMBIE_SYMBOL_REINTRODUCED" and f.location == "old_api" for f in receipt.findings)
     # old_api is excluded from retired_symbols, but old_helper is accurately certified!
     assert receipt.retired_symbols == ("old_helper",)
 
 
-def test_typescript_clean_delete_first() -> None:
+def test_typescript_clean_delete_first(tmp_path: Path) -> None:
     """Verify TypeScript functions, classes, interfaces, and types are accurately recognized as retired."""
     diff = """
 --- a/control_plane.ts
@@ -422,6 +508,10 @@ def test_typescript_clean_delete_first() -> None:
 -export const oldArrowHelper = (x: number) => x * 2;
 +export function newLeaseAcquire(): boolean { return true; }
 """
+    workspace = _make_workspace(
+        tmp_path,
+        {"control_plane.ts": "export function newLeaseAcquire(): boolean { return true; }\n"},
+    )
     basis = RetirementBasis(
         target_symbols=(
             "oldLeaseAcquire",
@@ -431,7 +521,7 @@ def test_typescript_clean_delete_first() -> None:
             "oldArrowHelper",
         ),
     )
-    receipt = evaluate_diff_hygiene(diff, basis)
+    receipt = evaluate_diff_hygiene(diff, basis, workspace=workspace)
     assert receipt.verdict == "passed", f"findings: {receipt.findings}"
     assert set(receipt.retired_symbols) == {
         "oldLeaseAcquire",
@@ -442,7 +532,7 @@ def test_typescript_clean_delete_first() -> None:
     }
 
 
-def test_typescript_call_deletion_does_not_retire_definition() -> None:
+def test_typescript_call_deletion_does_not_retire_definition(tmp_path: Path) -> None:
     """Verify deleting a TypeScript function call without deleting definition triggers AE001."""
     diff = """
 --- a/control_plane.ts
@@ -456,8 +546,21 @@ def test_typescript_call_deletion_does_not_retire_definition() -> None:
 +    return newLeaseAcquire();
  }
 """
+    workspace = _make_workspace(
+        tmp_path,
+        {
+            "control_plane.ts": (
+                "export function oldLeaseAcquire(): boolean {\n"
+                "    return false;\n"
+                "}\n"
+                "export function run() {\n"
+                "    return newLeaseAcquire();\n"
+                "}\n"
+            )
+        },
+    )
     basis = RetirementBasis(target_symbols=("oldLeaseAcquire",))
-    receipt = evaluate_diff_hygiene(diff, basis)
+    receipt = evaluate_diff_hygiene(diff, basis, workspace=workspace)
     assert receipt.verdict == "rejected"
     assert any(f.rule_id == "AE001-DELETE_FIRST_VIOLATION" for f in receipt.findings)
     assert "oldLeaseAcquire" not in receipt.retired_symbols
@@ -478,8 +581,8 @@ def test_typescript_zombie_symbol_reintroduced() -> None:
     assert any(f.rule_id == "AE002-ZOMBIE_SYMBOL_REINTRODUCED" for f in receipt.findings)
 
 
-def test_offline_self_contained_diff_without_disk_access() -> None:
-    """Verify diff verification is self-contained and works for non-existent disk paths."""
+def test_diff_only_verification_cannot_certify_retirement() -> None:
+    """Without a bound workspace the verdict may reject but never certifies retirement (AE004)."""
     diff = """
 --- a/non_existent_dir/virtual_module.py
 +++ b/non_existent_dir/virtual_module.py
@@ -490,11 +593,13 @@ def test_offline_self_contained_diff_without_disk_access() -> None:
 """
     basis = RetirementBasis(target_symbols=("obsolete_worker",))
     receipt = evaluate_diff_hygiene(diff, basis)
-    assert receipt.verdict == "passed"
-    assert receipt.retired_symbols == ("obsolete_worker",)
+    assert receipt.verdict == "rejected"
+    assert any(f.rule_id == "AE004-INSUFFICIENT_SOURCE_EVIDENCE" for f in receipt.findings)
+    assert receipt.retired_symbols == ()
+    assert receipt.source_evidence == "diff_only"
 
 
-def test_agent_tool_inspect_interface() -> None:
+def test_agent_tool_inspect_interface(tmp_path: Path) -> None:
     """Verify the structured agent tool anti_entropy_inspect returns complete, valid payload."""
     from loopx.capabilities.anti_entropy.agent_tool import anti_entropy_inspect
 
@@ -505,10 +610,12 @@ def test_agent_tool_inspect_interface() -> None:
 -export function legacyHandler() {}
 +export function modernHandler() {}
 """
+    workspace = _make_workspace(tmp_path, {"service.ts": "export function modernHandler() {}\n"})
     payload = anti_entropy_inspect(
         diff_text=diff,
         retirement_basis={"target_symbols": ["legacyHandler"]},
         goal_id="goal-test-tool",
+        workspace=str(workspace),
     )
     assert payload["ok"] is True
     assert payload["command"] == "verify"
@@ -569,18 +676,11 @@ index e69de29..0000000
     assert len(receipt.findings) == 0
 
 
-def test_docstring_sample_not_certified_when_function_retained_on_disk(tmp_path: Path, monkeypatch) -> None:
-    """Verify deleting docstring example lines does not falsely certify a function retained on disk, even from subdirs."""
-    repo_root = tmp_path / "mock_repo"
-    repo_root.mkdir()
-    (repo_root / ".git").mkdir()
-    subdir = repo_root / "nested" / "sub"
-    subdir.mkdir(parents=True)
-
-    module_file = repo_root / "service.py"
-    module_file.write_text(
-        """\"\"\"\nExample:\n    def old_api():\n        pass\n\"\"\"\n\ndef old_api():\n    return 42\n""",
-        encoding="utf-8",
+def test_docstring_sample_not_certified_when_function_retained_on_disk(tmp_path: Path) -> None:
+    """Deleting docstring example lines must not certify a function retained in the bound workspace."""
+    workspace = _make_workspace(
+        tmp_path,
+        {"service.py": '"""\nExample:\n    def old_api():\n        pass\n"""\n\ndef old_api():\n    return 42\n'},
     )
 
     diff_docstring = """
@@ -592,14 +692,163 @@ def test_docstring_sample_not_certified_when_function_retained_on_disk(tmp_path:
 """
     basis = RetirementBasis(target_symbols=("old_api",))
 
-    monkeypatch.chdir(repo_root)
-    receipt_root = evaluate_diff_hygiene(diff_docstring, basis)
-    assert receipt_root.verdict == "rejected"
-    assert any(f.rule_id == "AE001-DELETE_FIRST_VIOLATION" for f in receipt_root.findings)
-    assert "old_api" not in receipt_root.retired_symbols
+    receipt = evaluate_diff_hygiene(diff_docstring, basis, workspace=workspace)
+    assert receipt.verdict == "rejected"
+    assert any(f.rule_id == "AE001-DELETE_FIRST_VIOLATION" for f in receipt.findings)
+    assert "old_api" not in receipt.retired_symbols
 
-    monkeypatch.chdir(subdir)
-    receipt_sub = evaluate_diff_hygiene(diff_docstring, basis)
-    assert receipt_sub.verdict == "rejected"
-    assert any(f.rule_id == "AE001-DELETE_FIRST_VIOLATION" for f in receipt_sub.findings)
-    assert "old_api" not in receipt_sub.retired_symbols
+    # The same diff and workspace bound from a different CWD yields the same result:
+    # conclusions depend on the explicit binding, not the caller's working directory.
+    receipt_again = evaluate_diff_hygiene(diff_docstring, basis, workspace=workspace)
+    assert receipt_again.verdict == receipt.verdict
+    assert receipt_again.diff_hash == receipt.diff_hash
+
+
+def test_string_literal_mention_does_not_block_retirement(tmp_path: Path) -> None:
+    """A string mentioning the retired name is not an active reference (AE002 must not fire)."""
+    diff = """
+--- a/service.py
++++ b/service.py
+@@ -1,4 +1,4 @@
+-def old_api():
+-    return 1
++def new_api():
++    return "old_api has been removed"
+"""
+    workspace = _make_workspace(
+        tmp_path,
+        {"service.py": 'def new_api():\n    return "old_api has been removed"\n'},
+    )
+    basis = RetirementBasis(target_symbols=("old_api",))
+    receipt = evaluate_diff_hygiene(diff, basis, workspace=workspace)
+    assert receipt.verdict == "passed", f"findings: {receipt.findings}"
+    assert not any(f.rule_id == "AE002-ZOMBIE_SYMBOL_REINTRODUCED" for f in receipt.findings)
+    assert receipt.retired_symbols == ("old_api",)
+
+
+def test_readme_fenced_example_is_not_symbol_evidence(tmp_path: Path) -> None:
+    """Deleting a fenced def example from docs must not certify a definition still in real sources."""
+    diff = """
+--- a/README.md
++++ b/README.md
+@@ -5,4 +5,0 @@
+-```python
+-def old_api():
+-    pass
+-```
+"""
+    workspace = _make_workspace(
+        tmp_path,
+        {
+            "README.md": "# Docs\n\nUsage examples live elsewhere.\n",
+            "service.py": "def old_api():\n    return 42\n",
+        },
+    )
+    basis = RetirementBasis(target_symbols=("old_api",))
+    receipt = evaluate_diff_hygiene(diff, basis, workspace=workspace)
+    assert receipt.verdict == "rejected"
+    assert any(f.rule_id == "AE001-DELETE_FIRST_VIOLATION" for f in receipt.findings)
+    assert "old_api" not in receipt.retired_symbols
+
+
+def test_definition_in_untouched_file_is_caught_by_workspace_scan(tmp_path: Path) -> None:
+    """A definition living outside the diff still blocks certification via the bound workspace."""
+    diff = """
+--- a/client.py
++++ b/client.py
+@@ -1,3 +1,3 @@
+-import old_api
+ pass
+"""
+    workspace = _make_workspace(
+        tmp_path,
+        {
+            "client.py": "pass\n",
+            "service.py": "def old_api():\n    return 42\n",
+        },
+    )
+    basis = RetirementBasis(target_symbols=("old_api",))
+    receipt = evaluate_diff_hygiene(diff, basis, workspace=workspace)
+    assert receipt.verdict == "rejected"
+    assert any(f.rule_id == "AE001-DELETE_FIRST_VIOLATION" for f in receipt.findings)
+    assert "old_api" not in receipt.retired_symbols
+
+
+def test_missing_source_file_in_bound_workspace_cannot_certify(tmp_path: Path) -> None:
+    """A diff-touched source file missing from the bound workspace means evidence is insufficient."""
+    diff = """
+--- a/service.py
++++ b/service.py
+@@ -1,3 +1,2 @@
+-def old_api():
+-    return 1
++pass
+"""
+    # Bound workspace does NOT contain service.py at all.
+    workspace = _make_workspace(tmp_path, {"other.py": "x = 1\n"})
+    basis = RetirementBasis(target_symbols=("old_api",))
+    receipt = evaluate_diff_hygiene(diff, basis, workspace=workspace)
+    assert receipt.verdict == "rejected"
+    assert any(f.rule_id == "AE004-INSUFFICIENT_SOURCE_EVIDENCE" for f in receipt.findings)
+    assert "old_api" not in receipt.retired_symbols
+
+
+def test_same_diff_bound_to_different_workspaces_diverge(tmp_path: Path) -> None:
+    """Identical diff plus different bound workspaces yields correct, receipt-recorded verdicts."""
+    diff = """
+--- a/service.py
++++ b/service.py
+@@ -1,3 +1,2 @@
+-def old_api():
+-    return 1
++pass
+"""
+    basis = RetirementBasis(target_symbols=("old_api",))
+
+    ws_clean = _make_workspace(tmp_path / "clean", {"service.py": "pass\n"})
+    receipt_clean = evaluate_diff_hygiene(diff, basis, workspace=ws_clean)
+    assert receipt_clean.verdict == "passed"
+    assert receipt_clean.retired_symbols == ("old_api",)
+    assert receipt_clean.source_evidence == "workspace_sources"
+    assert receipt_clean.source_root == str(ws_clean)
+    assert receipt_clean.basis_hash
+
+    ws_dirty = _make_workspace(tmp_path / "dirty", {"service.py": "def old_api():\n    return 1\n"})
+    receipt_dirty = evaluate_diff_hygiene(diff, basis, workspace=ws_dirty)
+    assert receipt_dirty.verdict == "rejected"
+    assert "old_api" not in receipt_dirty.retired_symbols
+    assert receipt_dirty.source_root == str(ws_dirty)
+    assert receipt_dirty.basis_hash == receipt_clean.basis_hash
+
+
+def test_path_deleted_but_still_on_disk_is_contradiction(tmp_path: Path) -> None:
+    """A deleted-in-diff path that still exists in the bound workspace is an evidence mismatch."""
+    diff = """
+--- a/api.py
++++ /dev/null
+@@ -1,2 +0,0 @@
+-def f(): pass
+"""
+    basis = RetirementBasis(target_paths=("api.py",))
+
+    ws_stale = _make_workspace(tmp_path / "stale", {"api.py": "def f(): pass\n"})
+    receipt_stale = evaluate_diff_hygiene(diff, basis, workspace=ws_stale)
+    assert receipt_stale.verdict == "rejected"
+    assert any(f.rule_id == "AE004-INSUFFICIENT_SOURCE_EVIDENCE" for f in receipt_stale.findings)
+
+    ws_clean = _make_workspace(tmp_path / "clean", {"keep.py": "x = 1\n"})
+    receipt_clean = evaluate_diff_hygiene(diff, basis, workspace=ws_clean)
+    assert receipt_clean.verdict == "passed"
+    assert len(receipt_clean.findings) == 0
+
+
+def test_receipt_without_basis_has_empty_provenance(tmp_path: Path) -> None:
+    """Receipts without a declared basis carry empty basis_hash and diff_only evidence."""
+    receipt = evaluate_diff_hygiene("--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n-a\n+b\n")
+    assert receipt.basis_hash == ""
+    assert receipt.source_root is None
+    assert receipt.source_evidence == "diff_only"
+    assert ANTI_ENTROPY_RECEIPT_SCHEMA_VERSION == receipt.schema_version
+    assert ANTI_ENTROPY_RETIREMENT_BASIS_SCHEMA_VERSION == RetirementBasis().schema_version
+    assert ANTI_ENTROPY_CAPABILITY_ID == "anti-entropy-governance"
+    assert ANTI_ENTROPY_CATALOG_ENTRY["id"] == ANTI_ENTROPY_CAPABILITY_ID

@@ -3,9 +3,12 @@ from __future__ import annotations
 import ast
 import codecs
 import hashlib
+import json
+import os
 import re
 import textwrap
 from collections.abc import Mapping
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -48,13 +51,51 @@ _DOC_EXTENSIONS = {".md", ".rst", ".txt", ".json", ".yaml", ".yml", ".toml"}
 _TS_EXTENSIONS = {".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"}
 _PY_EXTENSIONS = {".py", ".pyi"}
 
+_RULE_AE001 = "AE001-DELETE_FIRST_VIOLATION"
+_RULE_AE002 = "AE002-ZOMBIE_SYMBOL_REINTRODUCED"
+_RULE_AE003 = "AE003-COMMENTED_CODE_ADVISORY"
+_RULE_AE004 = "AE004-INSUFFICIENT_SOURCE_EVIDENCE"
+
+_WORKSPACE_SKIP_DIRS = {
+    ".git",
+    ".hg",
+    ".svn",
+    "node_modules",
+    ".venv",
+    "venv",
+    "__pycache__",
+    ".tox",
+    ".nox",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    "dist",
+    "build",
+    ".idea",
+    ".vscode",
+}
+
+_MAX_SOURCE_FILE_BYTES = 2_000_000
+
+_MAX_WORKSPACE_FILES = 20000
+
 
 def _hash_diff(diff_text: str) -> str:
     return hashlib.sha256(diff_text.encode("utf-8")).hexdigest()
 
 
+def hash_retirement_basis(basis: RetirementBasis) -> str:
+    """Stable hash binding the receipt to the exact declared retirement intent."""
+    payload = json.dumps(basis.to_dict(), sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def find_repo_root(start_path: Path | None = None) -> Path:
-    """Resolve repository root by looking for .git folder up the tree."""
+    """Resolve repository root by looking for .git folder up the tree.
+
+    Kept for callers that locate a repository; verification itself requires an
+    explicitly bound workspace and no longer infers one from the CWD.
+    """
     cur = (start_path or Path.cwd()).resolve()
     for parent in [cur, *cur.parents]:
         if (parent / ".git").exists():
@@ -139,6 +180,11 @@ def parse_diff_git_header(line: str) -> tuple[str, str] | None:
     return None
 
 
+def _is_doc_file(file_path: str) -> bool:
+    ext = Path(file_path).suffix.lower() if file_path else ""
+    return ext in _DOC_EXTENSIONS
+
+
 def _extract_deleted_paths(diff_text: str) -> set[str]:
     deleted_paths: set[str] = set()
     diff_text = textwrap.dedent(diff_text)
@@ -179,32 +225,45 @@ def _extract_deleted_paths(diff_text: str) -> set[str]:
     return deleted_paths
 
 
-def _extract_python_defs_from_code(code: str) -> set[str]:
+def _extract_python_defs_from_code(code: str) -> set[str] | None:
+    """Extract Python definitions from a complete-parseable code block.
+
+    Returns None when the text cannot be parsed as Python at all (so callers can
+    treat it as unparseable rather than as "defines nothing").
+    """
     if not code.strip():
         return set()
     dedented = textwrap.dedent(code)
     try:
         tree = ast.parse(dedented)
-        return {
-            node.name
-            for node in ast.walk(tree)
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
-        }
+        return _python_def_names(tree)
     except SyntaxError:
         try:
             wrapped = "def _wrapper_():\n" + textwrap.indent(dedented, "    ")
             tree = ast.parse(wrapped)
             return {
-                node.name
-                for node in ast.walk(tree)
-                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
-                and node.name != "_wrapper_"
+                name
+                for name in _python_def_names(tree)
+                if name != "_wrapper_"
             }
         except SyntaxError:
-            return set()
+            return None
+
+
+def _python_def_names(tree: ast.AST) -> set[str]:
+    return {
+        node.name
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+    }
 
 
 def _extract_python_signature_defs(lines: list[str]) -> set[str]:
+    """Line-level fallback for code fragments that cannot be parsed as Python.
+
+    Only meaningful for in-diff code fragments; complete files must use the AST
+    result instead so that prose/docstring examples are never counted as defs.
+    """
     defs: set[str] = set()
     for line in lines:
         m = _PY_DEF_OR_CLASS_RE.match(line)
@@ -235,32 +294,177 @@ def _extract_ts_defs(lines: list[str]) -> set[str]:
     return defs
 
 
-def _extract_defs_for_file(lines: list[str], file_path: str = "") -> set[str]:
+def _strip_ts_line(line: str) -> str:
+    """Strip // comments and string-literal spans from a TS/JS-like line."""
+    line = re.sub(r"//.*$", "", line)
+    line = re.sub(r"/\*.*?(?:\*/|$)", "", line)
+    line = re.sub(r'"(?:\\.|[^"\\])*"', '""', line)
+    line = re.sub(r"'(?:\\.|[^'\\])*'", "''", line)
+    line = re.sub(r"`(?:\\.|[^`\\])*`", "``", line)
+    return line
+
+
+def _extract_ts_refs(lines: list[str], defs: set[str]) -> set[str]:
+    """Word-level references for TS/JS-like lines, excluding definition lines themselves."""
+    refs: set[str] = set()
+    for line in lines:
+        line_clean = line.strip()
+        is_def_line = any(
+            (m := pattern.match(line_clean)) and m.group(1) in defs
+            for pattern in _TS_DEF_PATTERNS
+        )
+        if is_def_line:
+            continue
+        for word in re.findall(r"[A-Za-z_$][A-Za-z0-9_$]*", _strip_ts_line(line)):
+            if word in defs:
+                refs.add(word)
+    return refs
+
+
+def _extract_defs_for_file(lines: list[str], file_path: str = "", is_full_file: bool = False) -> set[str]:
+    """Extract definitions for in-diff fragments of a file.
+
+    Documentation files never contribute symbol definitions: fenced examples in
+    markdown are prose, not code. For Python fragments, the AST result wins when
+    the fragment parses; the line-signature fallback only covers unparseable
+    fragments of code files.
+    """
+    if _is_doc_file(file_path):
+        return set()
+
     code_text = "\n".join(lines)
     ext = Path(file_path).suffix.lower() if file_path else ""
 
     if ext in _TS_EXTENSIONS:
         return _extract_ts_defs(lines)
     elif ext in _PY_EXTENSIONS:
-        return _extract_python_defs_from_code(code_text) | _extract_python_signature_defs(lines)
+        py_ast_defs = _extract_python_defs_from_code(code_text)
+        if py_ast_defs is not None:
+            return py_ast_defs
+        if is_full_file:
+            return set()
+        return _extract_python_signature_defs(lines)
     else:
-        py_defs = _extract_python_defs_from_code(code_text) | _extract_python_signature_defs(lines)
-        ts_defs = _extract_ts_defs(lines)
-        return py_defs | ts_defs
+        py_ast_defs = _extract_python_defs_from_code(code_text)
+        if py_ast_defs:
+            return py_ast_defs
+        if is_full_file:
+            return _extract_ts_defs(lines)
+        return _extract_python_signature_defs(lines) | _extract_ts_defs(lines)
 
 
-def _analyze_diff_symbols(diff_text: str) -> tuple[set[str], set[str], set[str], set[str], list[str]]:
-    """Analyze diff to extract deleted, reintroduced, surviving context, and disk defined symbols,
+@dataclass(frozen=True, slots=True)
+class _DiffSymbolAnalysis:
+    deleted_symbols: set[str] = field(default_factory=set)
+    reintroduced_symbols: set[str] = field(default_factory=set)
+    surviving_context_defs: set[str] = field(default_factory=set)
+    still_defined_on_disk: set[str] = field(default_factory=set)
+    all_added_lines: list[str] = field(default_factory=list)
+    unverified_source_files: tuple[str, ...] = ()
+    file_to_deleted_symbols: dict[str, set[str]] = field(default_factory=dict)
+    deleted_paths: set[str] = field(default_factory=set)
 
-    plus all added lines for reference auditing.
-    Returns:
-        (deleted_symbols, reintroduced_symbols, surviving_context_defs, still_defined_on_disk, all_added_lines)
+
+@dataclass(frozen=True, slots=True)
+class _WorkspaceEvidence:
+    """Complete post-change source evidence bound to an explicitly given workspace."""
+
+    root: Path
+    defined_symbols: dict[str, set[str]] = field(default_factory=dict)
+    referenced_symbols: dict[str, set[str]] = field(default_factory=dict)
+    existing_paths: set[str] = field(default_factory=set)
+
+
+def _extract_python_refs_from_code(code: str) -> set[str] | None:
+    """Extract real Python identifier references via AST (strings/docstrings excluded)."""
+    try:
+        tree = ast.parse(textwrap.dedent(code))
+    except SyntaxError:
+        return None
+    refs: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name):
+            refs.add(node.id)
+        elif isinstance(node, ast.Attribute):
+            refs.add(node.attr)
+        elif isinstance(node, ast.ImportFrom):
+            if node.module:
+                refs.add(node.module.split(".")[0])
+            for alias in node.names:
+                refs.add(alias.name.split(".")[0])
+                if alias.asname:
+                    refs.add(alias.asname)
+    return refs
+
+
+def _scan_workspace(workspace: Path, symbols: tuple[str, ...]) -> _WorkspaceEvidence:
+    """Scan an explicitly bound workspace for definitions and real references of target symbols.
+
+    Prefilters by substring so most files never reach the parser. Documentation
+    files are skipped: they are not executable evidence.
+    """
+    evidence = _WorkspaceEvidence(root=workspace)
+    if not symbols:
+        return evidence
+
+    symbol_set = set(symbols)
+    source_exts = _PY_EXTENSIONS | _TS_EXTENSIONS
+    visited = 0
+    for dirpath, dirnames, filenames in os.walk(workspace):
+        dirnames[:] = [d for d in dirnames if d not in _WORKSPACE_SKIP_DIRS]
+        for filename in filenames:
+            if visited >= _MAX_WORKSPACE_FILES:
+                return evidence
+            file_path = Path(dirpath) / filename
+            if file_path.suffix.lower() not in source_exts:
+                continue
+            try:
+                if file_path.stat().st_size > _MAX_SOURCE_FILE_BYTES:
+                    continue
+                content = file_path.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                continue
+            visited += 1
+            if not any(s in content for s in symbol_set):
+                continue
+            rel = file_path.relative_to(workspace).as_posix()
+            ext = file_path.suffix.lower()
+            if ext in _PY_EXTENSIONS:
+                defs = _extract_python_defs_from_code(content)
+                refs = _extract_python_refs_from_code(content)
+                if defs is None or refs is None:
+                    # Unparseable source cannot prove absence; treat the symbol
+                    # as still defined to avoid false certification.
+                    for s in symbol_set:
+                        if s in content:
+                            evidence.defined_symbols.setdefault(s, set()).add(rel)
+                    continue
+            else:
+                content_lines = content.splitlines()
+                defs = _extract_ts_defs(content_lines)
+                refs = _extract_ts_refs(content_lines, defs)
+            for s in symbol_set:
+                if s in defs:
+                    evidence.defined_symbols.setdefault(s, set()).add(rel)
+                if s in refs:
+                    evidence.referenced_symbols.setdefault(s, set()).add(rel)
+    return evidence
+
+
+def _analyze_diff_symbols(diff_text: str, workspace: Path | None = None) -> _DiffSymbolAnalysis:
+    """Analyze diff to extract deleted, reintroduced, surviving context, and disk-defined symbols.
+
+    Source binding: when ``workspace`` is provided, complete post-change sources
+    are read from that explicit root only — never from the caller's CWD. Files
+    that cannot be read from the bound workspace are reported as unverified.
     """
     deleted_symbols: set[str] = set()
     reintroduced_symbols: set[str] = set()
     surviving_context_defs: set[str] = set()
     still_defined_on_disk: set[str] = set()
     all_added_lines: list[str] = []
+    unverified_source_files: list[str] = []
+    file_to_deleted_symbols: dict[str, set[str]] = {}
 
     diff_text = textwrap.dedent(diff_text)
     file_diffs = re.split(r"(?=^diff --git |^--- )", diff_text, flags=re.MULTILINE)
@@ -279,6 +483,8 @@ def _analyze_diff_symbols(diff_text: str) -> tuple[set[str], set[str], set[str],
                 file_path = decode_git_diff_path(m_patch.group(1).strip(), is_source=False)
 
         hunk_texts = re.split(r"(?=^@@\s+-\d+.*?\s+\+\d+.*?\s+@@)", f_diff, flags=re.MULTILINE)
+        file_d_syms: set[str] = set()
+
         for h_text in hunk_texts:
             if not h_text.startswith("@@"):
                 continue
@@ -318,40 +524,246 @@ def _analyze_diff_symbols(diff_text: str) -> tuple[set[str], set[str], set[str],
             for s in pre_defs:
                 if s not in post_defs:
                     deleted_symbols.add(s)
+                    file_d_syms.add(s)
 
             for s in deleted_defs:
                 if s not in post_defs and s not in added_defs:
                     deleted_symbols.add(s)
+                    file_d_syms.add(s)
 
             for s in added_defs:
                 reintroduced_symbols.add(s)
+
+        if file_path:
+            file_to_deleted_symbols[file_path] = file_d_syms
 
         is_file_deleted = bool(
             re.search(r"^deleted file mode \d+", f_diff, re.MULTILINE)
             or re.search(r"^\+\+\+\s+/dev/null", f_diff, re.MULTILINE)
         )
-        if file_path and file_path != "/dev/null" and not is_file_deleted:
-            repo_root = find_repo_root()
-            disk_p = (repo_root / file_path).resolve()
-            if not disk_p.is_file():
-                disk_p = Path(file_path).resolve()
-            if disk_p.is_file():
-                try:
-                    content = disk_p.read_text(encoding="utf-8")
-                    disk_defs = _extract_defs_for_file(content.splitlines(), file_path)
-                    for s in disk_defs:
-                        still_defined_on_disk.add(s)
-                        if s in deleted_symbols:
-                            deleted_symbols.remove(s)
-                except Exception:
-                    pass
+        if file_path and file_path != "/dev/null" and not is_file_deleted and not _is_doc_file(file_path):
+            if workspace is None:
+                unverified_source_files.append(file_path)
+            else:
+                source_file = (workspace / file_path).resolve()
+                if not source_file.is_file():
+                    unverified_source_files.append(file_path)
+                else:
+                    try:
+                        content = source_file.read_text(encoding="utf-8")
+                        disk_defs = _extract_defs_for_file(
+                            content.splitlines(), file_path, is_full_file=True
+                        )
+                        if (
+                            Path(file_path).suffix.lower() in _PY_EXTENSIONS
+                            and _extract_python_defs_from_code(content) is None
+                        ):
+                            unverified_source_files.append(file_path)
+                            continue
+                        for s in disk_defs:
+                            still_defined_on_disk.add(s)
+                            if s in deleted_symbols:
+                                deleted_symbols.remove(s)
+                    except (OSError, UnicodeDecodeError):
+                        unverified_source_files.append(file_path)
 
-    return deleted_symbols, reintroduced_symbols, surviving_context_defs, still_defined_on_disk, all_added_lines
+    return _DiffSymbolAnalysis(
+        deleted_symbols=deleted_symbols,
+        reintroduced_symbols=reintroduced_symbols,
+        surviving_context_defs=surviving_context_defs,
+        still_defined_on_disk=still_defined_on_disk,
+        all_added_lines=all_added_lines,
+        unverified_source_files=tuple(unverified_source_files),
+        file_to_deleted_symbols=file_to_deleted_symbols,
+        deleted_paths=_extract_deleted_paths(diff_text),
+    )
+
+
+def _symbol_hunk_reintroduced(symbol: str, analysis: _DiffSymbolAnalysis) -> bool:
+    """True when the diff itself visibly re-adds a definition of the symbol."""
+    return symbol in analysis.reintroduced_symbols
+
+
+def _verify_symbol_targets(
+    basis: RetirementBasis,
+    analysis: _DiffSymbolAnalysis,
+    workspace_evidence: _WorkspaceEvidence | None,
+) -> tuple[list[AntiEntropyFinding], set[str]]:
+    """Evaluate each target symbol; returns (findings, certified_retired_symbols)."""
+    findings: list[AntiEntropyFinding] = []
+    certified: set[str] = set()
+
+    for symbol in basis.target_symbols:
+        # 1. Diff-visible zombie: definition re-added inside the diff itself.
+        if _symbol_hunk_reintroduced(symbol, analysis):
+            findings.append(
+                AntiEntropyFinding(
+                    rule_id=_RULE_AE002,
+                    severity="blocking",
+                    message=(
+                        f"Target symbol '{symbol}' was slated for retirement but reintroduced "
+                        "as an active definition in the diff."
+                    ),
+                    location=symbol,
+                )
+            )
+            continue
+
+        # 2. Symbol retirement is a derived fact about complete post-change
+        # sources. Without an explicitly bound workspace it cannot be certified.
+        if workspace_evidence is None:
+            findings.append(
+                AntiEntropyFinding(
+                    rule_id=_RULE_AE004,
+                    severity="blocking",
+                    message=(
+                        f"Target symbol '{symbol}' cannot be certified as retired: no source "
+                        "workspace was bound. Pass an explicit workspace containing the complete "
+                        "post-change sources; a diff alone does not prove definition removal."
+                    ),
+                    location=symbol,
+                )
+            )
+            continue
+
+        unverified_files = [
+            f
+            for f in analysis.unverified_source_files
+            if symbol in analysis.file_to_deleted_symbols.get(f, set())
+        ]
+        if unverified_files:
+            findings.append(
+                AntiEntropyFinding(
+                    rule_id=_RULE_AE004,
+                    severity="blocking",
+                    message=(
+                        f"Target symbol '{symbol}' cannot be certified as retired: complete "
+                        f"post-change source is unavailable in the bound workspace for {', '.join(unverified_files)}."
+                    ),
+                    location=symbol,
+                )
+            )
+            continue
+
+        # 3. Real references in post-change sources (AST identifiers exclude
+        # string literals, comments and docstring examples).
+        ref_files = sorted(workspace_evidence.referenced_symbols.get(symbol, set()))
+        if ref_files:
+            findings.append(
+                AntiEntropyFinding(
+                    rule_id=_RULE_AE002,
+                    severity="blocking",
+                    message=(
+                        f"Target symbol '{symbol}' was slated for retirement but is still "
+                        f"referenced by post-change sources: {', '.join(ref_files)}."
+                    ),
+                    location=symbol,
+                )
+            )
+            continue
+
+        # 4. Definition removal: complete workspace scan is authoritative, so a
+        # retained definition is caught even when the diff only edited prose.
+        def_files = sorted(workspace_evidence.defined_symbols.get(symbol, set()))
+        if def_files:
+            severity = "advisory" if basis.allow_compat_seam else "blocking"
+            findings.append(
+                AntiEntropyFinding(
+                    rule_id=_RULE_AE001,
+                    severity=severity,
+                    message=(
+                        f"Target symbol '{symbol}' was declared for retirement but its definition "
+                        f"is still present in post-change sources: {', '.join(def_files)}. "
+                        "Delete-first requires removing superseded definitions rather than "
+                        "merely removing calls, altering docs, or adding wrappers."
+                    ),
+                    location=symbol,
+                )
+            )
+            continue
+
+        # 5. Unchanged context lines are diff-visible facts: a definition kept as
+        # hunk context was never removed by this diff.
+        if symbol in analysis.surviving_context_defs:
+            if workspace_evidence is None:
+                findings.append(
+                    AntiEntropyFinding(
+                        rule_id=_RULE_AE001,
+                        severity="blocking" if not basis.allow_compat_seam else "advisory",
+                        message=(
+                            f"Target symbol '{symbol}' was declared for retirement but its "
+                            "definition is still present in unchanged diff context lines. "
+                            "Delete-first requires removing superseded definitions."
+                        ),
+                        location=symbol,
+                    )
+                )
+            else:
+                findings.append(
+                    AntiEntropyFinding(
+                        rule_id=_RULE_AE004,
+                        severity="blocking",
+                        message=(
+                            f"Target symbol '{symbol}' appears as a retained definition in the diff "
+                            "context but was not found in the bound workspace sources; the patch "
+                            "does not match the bound post-change sources."
+                        ),
+                        location=symbol,
+                    )
+                )
+            continue
+
+        # 6. No definition remains anywhere in the bound workspace. Positive
+        # deletion evidence in the diff attributes the retirement to this change.
+        if symbol in analysis.deleted_symbols or symbol in analysis.deleted_paths:
+            certified.add(symbol)
+
+    return findings, certified
+
+
+def _verify_path_targets(
+    basis: RetirementBasis,
+    analysis: _DiffSymbolAnalysis,
+    workspace_evidence: _WorkspaceEvidence | None,
+) -> list[AntiEntropyFinding]:
+    findings: list[AntiEntropyFinding] = []
+    for path in basis.target_paths:
+        norm_path = normalize_repo_path(path)
+        if norm_path not in analysis.deleted_paths:
+            findings.append(
+                AntiEntropyFinding(
+                    rule_id=_RULE_AE001,
+                    severity="blocking" if not basis.allow_compat_seam else "advisory",
+                    message=(
+                        f"Target path '{path}' was declared for retirement in RetirementBasis "
+                        "but was not removed in the diff."
+                    ),
+                    location=path,
+                )
+            )
+            continue
+        if workspace_evidence is not None and norm_path != "/dev/null":
+            disk_path = (workspace_evidence.root / norm_path).resolve()
+            if disk_path.exists():
+                findings.append(
+                    AntiEntropyFinding(
+                        rule_id=_RULE_AE004,
+                        severity="blocking",
+                        message=(
+                            f"Target path '{path}' is deleted in the diff but still exists in the "
+                            "bound workspace; the patch does not match the bound post-change sources."
+                        ),
+                        location=path,
+                    )
+                )
+    return findings
 
 
 def verify_delete_first(
     diff_text: str,
     retirement_basis: RetirementBasis | Mapping[str, Any] | None = None,
+    workspace: str | Path | None = None,
+    _analysis: _DiffSymbolAnalysis | None = None,
 ) -> list[AntiEntropyFinding]:
     findings: list[AntiEntropyFinding] = []
 
@@ -368,11 +780,13 @@ def verify_delete_first(
         return findings
 
     diff_text = textwrap.dedent(diff_text)
+    analysis = _analysis or _analyze_diff_symbols(diff_text, Path(workspace) if workspace else None)
+
     if not diff_text.strip():
         for symbol in basis.target_symbols:
             findings.append(
                 AntiEntropyFinding(
-                    rule_id="AE001-DELETE_FIRST_VIOLATION",
+                    rule_id=_RULE_AE001,
                     severity="blocking" if not basis.allow_compat_seam else "advisory",
                     message=(
                         f"Target symbol '{symbol}' was declared for retirement but diff is empty. "
@@ -384,7 +798,7 @@ def verify_delete_first(
         for path in basis.target_paths:
             findings.append(
                 AntiEntropyFinding(
-                    rule_id="AE001-DELETE_FIRST_VIOLATION",
+                    rule_id=_RULE_AE001,
                     severity="blocking" if not basis.allow_compat_seam else "advisory",
                     message=(
                         f"Target path '{path}' was declared for retirement but diff is empty."
@@ -394,63 +808,13 @@ def verify_delete_first(
             )
         return findings
 
-    deleted_symbols, reintroduced_symbols, surviving_context_defs, still_defined_on_disk, all_added_lines = _analyze_diff_symbols(diff_text)
-    deleted_paths = _extract_deleted_paths(diff_text)
+    workspace_evidence: _WorkspaceEvidence | None = None
+    if workspace is not None and (basis.target_symbols or basis.target_paths):
+        workspace_evidence = _scan_workspace(Path(workspace), basis.target_symbols)
 
-    for symbol in basis.target_symbols:
-        # Check if the symbol is reintroduced as definition OR actively referenced/called in added code
-        is_reintroduced = symbol in reintroduced_symbols
-        if not is_reintroduced:
-            sym_pattern = re.compile(r"\b" + re.escape(symbol) + r"\b")
-            for added_l in all_added_lines:
-                clean_added = added_l.strip()
-                if clean_added.startswith(("#", "//", "/*", "*")):
-                    continue
-                if sym_pattern.search(clean_added):
-                    is_reintroduced = True
-                    break
-
-        if is_reintroduced:
-            findings.append(
-                AntiEntropyFinding(
-                    rule_id="AE002-ZOMBIE_SYMBOL_REINTRODUCED",
-                    severity="blocking",
-                    message=(
-                        f"Target symbol '{symbol}' was slated for retirement but reintroduced "
-                        "as an active definition or called in added lines in the diff or repository."
-                    ),
-                    location=symbol,
-                )
-            )
-        elif symbol not in deleted_symbols or symbol in surviving_context_defs or symbol in still_defined_on_disk:
-            findings.append(
-                AntiEntropyFinding(
-                    rule_id="AE001-DELETE_FIRST_VIOLATION",
-                    severity="blocking" if not basis.allow_compat_seam else "advisory",
-                    message=(
-                        f"Target symbol '{symbol}' was declared for retirement in RetirementBasis "
-                        "but its definition was not removed from the diff. Delete-first requires deleting "
-                        "superseded definitions rather than merely removing calls, altering docs, or adding wrappers."
-                    ),
-                    location=symbol,
-                )
-            )
-
-    for path in basis.target_paths:
-        norm_path = normalize_repo_path(path)
-        if norm_path not in deleted_paths:
-            findings.append(
-                AntiEntropyFinding(
-                    rule_id="AE001-DELETE_FIRST_VIOLATION",
-                    severity="blocking" if not basis.allow_compat_seam else "advisory",
-                    message=(
-                        f"Target path '{path}' was declared for retirement in RetirementBasis "
-                        "but was not removed in the diff."
-                    ),
-                    location=path,
-                )
-            )
-
+    symbol_findings, _certified = _verify_symbol_targets(basis, analysis, workspace_evidence)
+    findings.extend(symbol_findings)
+    findings.extend(_verify_path_targets(basis, analysis, workspace_evidence))
     return findings
 
 
@@ -518,7 +882,7 @@ def audit_ghost_code(diff_text: str) -> list[AntiEntropyFinding]:
             if consecutive_commented_code >= 3:
                 findings.append(
                     AntiEntropyFinding(
-                        rule_id="AE003-COMMENTED_CODE_ADVISORY",
+                        rule_id=_RULE_AE003,
                         severity="advisory",
                         message=(
                             "Detected 3+ consecutive lines of commented-out code. "
@@ -535,49 +899,48 @@ def audit_ghost_code(diff_text: str) -> list[AntiEntropyFinding]:
 def evaluate_diff_hygiene(
     diff_text: str,
     retirement_basis: RetirementBasis | Mapping[str, Any] | None = None,
+    workspace: str | Path | None = None,
 ) -> AntiEntropyReceipt:
     diff_text = textwrap.dedent(diff_text)
     diff_hash = _hash_diff(diff_text)
     all_findings: list[AntiEntropyFinding] = []
 
-    all_findings.extend(verify_delete_first(diff_text, retirement_basis))
-    all_findings.extend(audit_ghost_code(diff_text))
-
-    has_blocking = any(f.severity == "blocking" for f in all_findings)
-    verdict = "rejected" if has_blocking else "passed"
-
-    retired: list[str] = []
-    if retirement_basis:
+    basis: RetirementBasis | None = None
+    if retirement_basis is not None:
         basis = (
             retirement_basis
             if isinstance(retirement_basis, RetirementBasis)
             else RetirementBasis.from_dict(retirement_basis)
         )
-        if basis.target_symbols and diff_text.strip():
-            deleted_symbols, reintroduced_symbols, surviving_context_defs, still_defined_on_disk, all_added_lines = _analyze_diff_symbols(diff_text)
-            failing_symbols = {
-                f.location for f in all_findings
-                if f.location and f.rule_id in ("AE001-DELETE_FIRST_VIOLATION", "AE002-ZOMBIE_SYMBOL_REINTRODUCED")
-            }
-            for s in basis.target_symbols:
-                sym_pattern = re.compile(r"\b" + re.escape(s) + r"\b")
-                has_added_ref = any(
-                    sym_pattern.search(l) for l in all_added_lines
-                    if not l.strip().startswith(("#", "//", "/*", "*"))
-                )
-                if (
-                    s in deleted_symbols
-                    and s not in reintroduced_symbols
-                    and not has_added_ref
-                    and s not in surviving_context_defs
-                    and s not in still_defined_on_disk
-                    and s not in failing_symbols
-                ):
-                    retired.append(s)
+
+    workspace_path = Path(workspace) if workspace is not None else None
+    source_evidence = "workspace_sources" if workspace_path is not None else "diff_only"
+
+    analysis = _analyze_diff_symbols(diff_text, workspace_path)
+
+    if basis is not None and (basis.target_symbols or basis.target_paths):
+        workspace_evidence: _WorkspaceEvidence | None = None
+        if workspace_path is not None and (basis.target_symbols or basis.target_paths):
+            workspace_evidence = _scan_workspace(workspace_path, basis.target_symbols)
+        symbol_findings, certified = _verify_symbol_targets(basis, analysis, workspace_evidence)
+        all_findings.extend(symbol_findings)
+        all_findings.extend(_verify_path_targets(basis, analysis, workspace_evidence))
+    else:
+        certified = set()
+
+    all_findings.extend(audit_ghost_code(diff_text))
+
+    has_blocking = any(f.severity == "blocking" for f in all_findings)
+    verdict = "rejected" if has_blocking else "passed"
+
+    retired: list[str] = sorted(certified)
 
     return AntiEntropyReceipt(
         diff_hash=diff_hash,
         verdict=verdict,
         findings=tuple(all_findings),
-        retired_symbols=tuple(sorted(retired)),
+        retired_symbols=tuple(retired),
+        basis_hash=hash_retirement_basis(basis) if basis is not None else "",
+        source_root=str(workspace_path) if workspace_path is not None else None,
+        source_evidence=source_evidence,
     )

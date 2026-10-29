@@ -118,7 +118,13 @@ class AntiEntropyFinding:
 
 @dataclass(frozen=True, slots=True)
 class AntiEntropyReceipt:
-    """Durable receipt verifying diff hygiene and delete-first enforcement."""
+    """Durable receipt verifying diff hygiene and delete-first enforcement.
+
+    Evidence provenance: ``basis_hash`` binds the receipt to the exact declared
+    retirement intent; ``source_root`` and ``source_evidence`` record which
+    post-change sources (if any) backed the verdict. A ``diff_only`` receipt can
+    reject but never certifies symbol retirement.
+    """
 
     schema_version: str = ANTI_ENTROPY_RECEIPT_SCHEMA_VERSION
     receipt_id: str = field(default="")
@@ -127,6 +133,9 @@ class AntiEntropyReceipt:
     findings: tuple[AntiEntropyFinding, ...] = ()
     retired_symbols: tuple[str, ...] = ()
     timestamp_utc: float = field(default_factory=time.time)
+    basis_hash: str = field(default="")
+    source_root: str | None = field(default=None)
+    source_evidence: str = "diff_only"  # "workspace_sources" | "diff_only"
 
     def to_dict(self) -> dict[str, Any]:
         receipt_id = self.receipt_id
@@ -141,4 +150,7 @@ class AntiEntropyReceipt:
             "findings": [f.to_dict() for f in self.findings],
             "retired_symbols": list(self.retired_symbols),
             "timestamp_utc": self.timestamp_utc,
+            "basis_hash": self.basis_hash,
+            "source_root": self.source_root,
+            "source_evidence": self.source_evidence,
         }

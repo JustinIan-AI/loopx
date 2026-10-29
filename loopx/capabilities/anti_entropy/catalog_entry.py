@@ -31,7 +31,7 @@ ANTI_ENTROPY_CATALOG_ENTRY: dict[str, Any] = {
         "re-introducing wrappers, zombie symbols, or ghost code."
     ),
     "entry_command": (
-        "loopx anti-entropy verify --goal-id <goal-id> --diff-file <diff.patch> --format json"
+        "loopx anti-entropy inspect --goal-id <goal-id> --diff-file <diff.patch> --workspace <sources> --format json"
     ),
     "workflow_skill": {
         "name": "loopx-anti-entropy",
@@ -41,14 +41,34 @@ ANTI_ENTROPY_CATALOG_ENTRY: dict[str, Any] = {
     },
     "commands": [
         {
-            "command": "loopx anti-entropy verify --goal-id <goal-id> --diff-file <diff.patch> --format json",
+            "command": "loopx anti-entropy verify --goal-id <goal-id> --diff-file <diff.patch> --workspace <sources> --format json",
             "purpose": "Verify exact diff hygiene and delete-first compliance against a declared retirement basis.",
             "write_boundary": "read-only diff verification and receipt generation; no repository mutation",
+        },
+        {
+            "command": "loopx anti-entropy inspect --goal-id <goal-id> --diff-file <diff.patch> --workspace <sources> --format json",
+            "purpose": (
+                "In-flight agent check with actionable feedback; rejections are "
+                "progress facts, not final delivery failures."
+            ),
+            "write_boundary": "read-only diff verification; no receipt store writes",
         },
         {
             "command": "loopx capability show anti-entropy-governance --format json",
             "purpose": "Inspect anti-entropy capability metadata, commands, and protocols.",
             "write_boundary": "read-only metadata projection",
+        },
+    ],
+    "agent_tools": [
+        {
+            "name": "anti_entropy_inspect",
+            "descriptor": "loopx.capabilities.anti_entropy.feedback.ANTI_ENTROPY_INSPECT_TOOL_DESCRIPTOR",
+            "entrypoint": "loopx.capabilities.anti_entropy.agent_tool.anti_entropy_inspect",
+            "purpose": (
+                "Agent-callable inspection returning actionable findings as "
+                "progress facts plus an immutable receipt."
+            ),
+            "write_boundary": "read-only verification; no host state mutation",
         },
     ],
     "implemented_protocols": [
