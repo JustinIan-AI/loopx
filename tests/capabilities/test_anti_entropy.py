@@ -401,3 +401,205 @@ def test_reintroduced_symbol_excluded_from_retired_symbols_with_partial_retireme
     assert any(f.rule_id == "AE002-ZOMBIE_SYMBOL_REINTRODUCED" and f.location == "old_api" for f in receipt.findings)
     # old_api is excluded from retired_symbols, but old_helper is accurately certified!
     assert receipt.retired_symbols == ("old_helper",)
+
+
+def test_typescript_clean_delete_first() -> None:
+    """Verify TypeScript functions, classes, interfaces, and types are accurately recognized as retired."""
+    diff = """
+--- a/control_plane.ts
++++ b/control_plane.ts
+@@ -1,15 +1,2 @@
+-export function oldLeaseAcquire(taskId: string): boolean {
+-    return false;
+-}
+-export class OldScheduler {
+-    run(): void {}
+-}
+-export interface OldLeaseConfig {
+-    timeoutMs: number;
+-}
+-export type OldLeaseState = "active" | "expired";
+-export const oldArrowHelper = (x: number) => x * 2;
++export function newLeaseAcquire(): boolean { return true; }
+"""
+    basis = RetirementBasis(
+        target_symbols=(
+            "oldLeaseAcquire",
+            "OldScheduler",
+            "OldLeaseConfig",
+            "OldLeaseState",
+            "oldArrowHelper",
+        ),
+    )
+    receipt = evaluate_diff_hygiene(diff, basis)
+    assert receipt.verdict == "passed", f"findings: {receipt.findings}"
+    assert set(receipt.retired_symbols) == {
+        "oldLeaseAcquire",
+        "OldScheduler",
+        "OldLeaseConfig",
+        "OldLeaseState",
+        "oldArrowHelper",
+    }
+
+
+def test_typescript_call_deletion_does_not_retire_definition() -> None:
+    """Verify deleting a TypeScript function call without deleting definition triggers AE001."""
+    diff = """
+--- a/control_plane.ts
++++ b/control_plane.ts
+@@ -1,7 +1,7 @@
+ export function oldLeaseAcquire(): boolean {
+     return false;
+ }
+ export function run() {
+-    return oldLeaseAcquire();
++    return newLeaseAcquire();
+ }
+"""
+    basis = RetirementBasis(target_symbols=("oldLeaseAcquire",))
+    receipt = evaluate_diff_hygiene(diff, basis)
+    assert receipt.verdict == "rejected"
+    assert any(f.rule_id == "AE001-DELETE_FIRST_VIOLATION" for f in receipt.findings)
+    assert "oldLeaseAcquire" not in receipt.retired_symbols
+
+
+def test_typescript_zombie_symbol_reintroduced() -> None:
+    """Verify reintroducing an old TypeScript function as a wrapper triggers AE002."""
+    diff = """
+--- a/control_plane.ts
++++ b/control_plane.ts
+@@ -1,4 +1,4 @@
+-export function oldTaskLease() { return 1; }
++export function oldTaskLease() { return newTaskLease(); }
+"""
+    basis = RetirementBasis(target_symbols=("oldTaskLease",))
+    receipt = evaluate_diff_hygiene(diff, basis)
+    assert receipt.verdict == "rejected"
+    assert any(f.rule_id == "AE002-ZOMBIE_SYMBOL_REINTRODUCED" for f in receipt.findings)
+
+
+def test_offline_self_contained_diff_without_disk_access() -> None:
+    """Verify diff verification is self-contained and works for non-existent disk paths."""
+    diff = """
+--- a/non_existent_dir/virtual_module.py
++++ b/non_existent_dir/virtual_module.py
+@@ -1,5 +1,2 @@
+-def obsolete_worker():
+-    return None
++def active_worker(): return 1
+"""
+    basis = RetirementBasis(target_symbols=("obsolete_worker",))
+    receipt = evaluate_diff_hygiene(diff, basis)
+    assert receipt.verdict == "passed"
+    assert receipt.retired_symbols == ("obsolete_worker",)
+
+
+def test_agent_tool_inspect_interface() -> None:
+    """Verify the structured agent tool anti_entropy_inspect returns complete, valid payload."""
+    from loopx.capabilities.anti_entropy.agent_tool import anti_entropy_inspect
+
+    diff = """
+--- a/service.ts
++++ b/service.ts
+@@ -1,4 +1,2 @@
+-export function legacyHandler() {}
++export function modernHandler() {}
+"""
+    payload = anti_entropy_inspect(
+        diff_text=diff,
+        retirement_basis={"target_symbols": ["legacyHandler"]},
+        goal_id="goal-test-tool",
+    )
+    assert payload["ok"] is True
+    assert payload["command"] == "verify"
+    assert payload["goal_id"] == "goal-test-tool"
+    assert payload["retired_symbols"] == ["legacyHandler"]
+    assert payload["verdict"] == "passed"
+
+
+def test_path_normalization_distinguishes_a_dir_and_dot_files() -> None:
+    """Verify a/api.py, api.py, and .api.py are never conflated."""
+    diff_delete_root = """
+--- a/api.py
++++ /dev/null
+@@ -1,2 +0,0 @@
+-def f(): pass
+"""
+    basis_a = RetirementBasis(target_paths=("a/api.py",))
+    receipt_a = evaluate_diff_hygiene(diff_delete_root, basis_a)
+    assert receipt_a.verdict == "rejected"
+    assert any(f.rule_id == "AE001-DELETE_FIRST_VIOLATION" and f.location == "a/api.py" for f in receipt_a.findings)
+
+    basis_dot = RetirementBasis(target_paths=(".api.py",))
+    receipt_dot = evaluate_diff_hygiene(diff_delete_root, basis_dot)
+    assert receipt_dot.verdict == "rejected"
+    assert any(f.rule_id == "AE001-DELETE_FIRST_VIOLATION" and f.location == ".api.py" for f in receipt_dot.findings)
+
+    diff_delete_nested_a = """
+--- a/a/api.py
++++ /dev/null
+@@ -1,2 +0,0 @@
+-def f(): pass
+"""
+    receipt_nested = evaluate_diff_hygiene(diff_delete_nested_a, basis_a)
+    assert receipt_nested.verdict == "passed"
+    assert len(receipt_nested.findings) == 0
+
+    diff_delete_dot = """
+--- a/.api.py
++++ /dev/null
+@@ -1,2 +0,0 @@
+-def f(): pass
+"""
+    receipt_dot_pass = evaluate_diff_hygiene(diff_delete_dot, basis_dot)
+    assert receipt_dot_pass.verdict == "passed"
+    assert len(receipt_dot_pass.findings) == 0
+
+
+def test_empty_file_deletion_with_spaces_in_filename() -> None:
+    """Verify unquoted git diff headers for empty files with spaces in names are correctly recognized."""
+    diff_spaces = """
+diff --git a/legacy/old api.py b/legacy/old api.py
+deleted file mode 100644
+index e69de29..0000000
+"""
+    basis = RetirementBasis(target_paths=("legacy/old api.py",))
+    receipt = evaluate_diff_hygiene(diff_spaces, basis)
+    assert receipt.verdict == "passed", f"findings: {receipt.findings}"
+    assert len(receipt.findings) == 0
+
+
+def test_docstring_sample_not_certified_when_function_retained_on_disk(tmp_path: Path, monkeypatch) -> None:
+    """Verify deleting docstring example lines does not falsely certify a function retained on disk, even from subdirs."""
+    repo_root = tmp_path / "mock_repo"
+    repo_root.mkdir()
+    (repo_root / ".git").mkdir()
+    subdir = repo_root / "nested" / "sub"
+    subdir.mkdir(parents=True)
+
+    module_file = repo_root / "service.py"
+    module_file.write_text(
+        """\"\"\"\nExample:\n    def old_api():\n        pass\n\"\"\"\n\ndef old_api():\n    return 42\n""",
+        encoding="utf-8",
+    )
+
+    diff_docstring = """
+--- a/service.py
++++ b/service.py
+@@ -3,2 +3,0 @@
+-    def old_api():
+-        pass
+"""
+    basis = RetirementBasis(target_symbols=("old_api",))
+
+    monkeypatch.chdir(repo_root)
+    receipt_root = evaluate_diff_hygiene(diff_docstring, basis)
+    assert receipt_root.verdict == "rejected"
+    assert any(f.rule_id == "AE001-DELETE_FIRST_VIOLATION" for f in receipt_root.findings)
+    assert "old_api" not in receipt_root.retired_symbols
+
+    monkeypatch.chdir(subdir)
+    receipt_sub = evaluate_diff_hygiene(diff_docstring, basis)
+    assert receipt_sub.verdict == "rejected"
+    assert any(f.rule_id == "AE001-DELETE_FIRST_VIOLATION" for f in receipt_sub.findings)
+    assert "old_api" not in receipt_sub.retired_symbols

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from .agent_tool import anti_entropy_inspect
 from .catalog_entry import ANTI_ENTROPY_CATALOG_ENTRY
 from .cli import run_anti_entropy_verify
 from .contract import (
@@ -24,6 +25,7 @@ __all__ = [
     "AntiEntropyFinding",
     "AntiEntropyReceipt",
     "RetirementBasis",
+    "anti_entropy_inspect",
     "audit_ghost_code",
     "evaluate_diff_hygiene",
     "run_anti_entropy_verify",
