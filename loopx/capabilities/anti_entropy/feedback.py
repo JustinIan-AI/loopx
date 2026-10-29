@@ -31,8 +31,14 @@ _INSPECT_CLI_ROUTE = (
 )
 
 _DELIVERY_ROUTE = (
-    "loopx change-quality record --goal-id <goal-id> --result-path <result.json> "
-    "then loopx change-quality verify --goal-id <goal-id>"
+    "loopx change-quality prepare --goal-id <goal-id> "
+    "(bind --repo-path/--base-ref to the reviewed scope), "
+    "then loopx change-quality record --goal-id <goal-id> "
+    "--result-json <result.json> --execute "
+    "(result conforms to change_quality_agent_result_v2 with the prepared "
+    "scope_fingerprint), "
+    "then loopx change-quality verify --goal-id <goal-id> "
+    "(same --repo-path/--base-ref)"
 )
 
 _TOOL_NAME = "anti_entropy_inspect"

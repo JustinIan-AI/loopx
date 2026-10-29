@@ -35,8 +35,8 @@ ANTI_ENTROPY_CATALOG_ENTRY: dict[str, Any] = {
     ),
     "workflow_skill": {
         "name": "loopx-anti-entropy",
-        "delivery": "standalone_cli",
-        "activation": "explicit_command_execution",
+        "delivery": "turn_context_hook_and_shared_cli",
+        "activation": "explicit_task_scoped_enablement",
         "project_copy_required": False,
     },
     "commands": [
@@ -89,10 +89,13 @@ ANTI_ENTROPY_CATALOG_ENTRY: dict[str, Any] = {
     ],
     "docs": [_README],
     "boundaries": [
-        "The capability is default-off and operates as an opt-in code hygiene verifier via CLI and typed receipts.",
+        "The capability is default-off and task-scoped: a turn receives the retirement context only when the task explicitly declares a retirement basis or enables the capability; disabled turns get zero injection.",
+        "The turn-context hook projects declared targets, the inspect tool, and delete-first guidance into host input via the shared attach_turn_context composition; it grants no execution authority.",
+        "The CLI (verify/inspect) remains the shared verification entry for humans and agents; final delivery acceptance is owned by the existing change-quality prepare/record/verify owner.",
         "Delete-first requires target old logic to be cleanly decommissioned in the diff without re-introducing wrappers or zombie symbols.",
         "AST-based diff hygiene verifies exact code diffs without mutating repository code or performing speculative git writes.",
         "Target paths declared for decommissioning must be cleanly removed in the unified diff.",
+        "Symbol retirement certification requires a completely scanned, explicitly bound post-change workspace; truncated scans (oversized files, unreadable files, file-count limits) block certification with AE004.",
         "Advisory findings highlight non-blocking hygiene opportunities (such as dead commented code) without causing false positive rejections of documentation or explanations.",
         "Inspired by and adopting core engineering principles of delete-first code retirement from Aegis.",
     ],

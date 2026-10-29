@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from loopx.capabilities.anti_entropy import (
     ANTI_ENTROPY_CAPABILITY_ID,
     ANTI_ENTROPY_CATALOG_ENTRY,
@@ -852,3 +854,184 @@ def test_receipt_without_basis_has_empty_provenance(tmp_path: Path) -> None:
     assert ANTI_ENTROPY_RETIREMENT_BASIS_SCHEMA_VERSION == RetirementBasis().schema_version
     assert ANTI_ENTROPY_CAPABILITY_ID == "anti-entropy-governance"
     assert ANTI_ENTROPY_CATALOG_ENTRY["id"] == ANTI_ENTROPY_CAPABILITY_ID
+
+
+def test_typescript_cross_file_reference_rejects_and_prevents_false_retirement(tmp_path: Path) -> None:
+    """Verify cross-file TS/JS member access (api.old_api()) blocks retirement certification."""
+    diff = """
+--- a/service.mjs
++++ b/service.mjs
+@@ -1,2 +1,2 @@
+-export function old_api() { return 1; }
++export function new_api() { return 2; }
+"""
+    basis = RetirementBasis(target_symbols=("old_api",))
+    ws = _make_workspace(
+        tmp_path / "ws_unmigrated",
+        {
+            "service.mjs": "export function new_api() { return 2; }\n",
+            "client.mjs": "import * as api from './service.mjs';\nexport function run() { return api.old_api(); }\n",
+        },
+    )
+
+    receipt = evaluate_diff_hygiene(diff, basis, workspace=ws)
+    assert receipt.verdict == "rejected"
+    assert any(
+        f.rule_id == "AE002-ZOMBIE_SYMBOL_REINTRODUCED" and "client.mjs" in f.message
+        for f in receipt.findings
+    )
+    assert receipt.retired_symbols == ()
+
+
+def test_typescript_cross_file_reference_passed_after_caller_migrated(tmp_path: Path) -> None:
+    """Verify paired positive case: retirement certifies after caller migrates away from old_api."""
+    diff = """
+--- a/service.mjs
++++ b/service.mjs
+@@ -1,2 +1,2 @@
+-export function old_api() { return 1; }
++export function new_api() { return 2; }
+--- a/client.mjs
++++ b/client.mjs
+@@ -2,1 +2,1 @@
+-export function run() { return api.old_api(); }
++export function run() { return api.new_api(); }
+"""
+    basis = RetirementBasis(target_symbols=("old_api",))
+    ws = _make_workspace(
+        tmp_path / "ws_migrated",
+        {
+            "service.mjs": "export function new_api() { return 2; }\n",
+            "client.mjs": "import * as api from './service.mjs';\nexport function run() { return api.new_api(); }\n",
+        },
+    )
+
+    receipt = evaluate_diff_hygiene(diff, basis, workspace=ws)
+    assert receipt.verdict == "passed", f"findings: {receipt.findings}"
+    assert receipt.retired_symbols == ("old_api",)
+
+
+def test_workspace_scan_truncation_on_large_file_fails_with_ae004(tmp_path: Path) -> None:
+    """Verify files exceeding scan size limits block certification with AE004 rather than false passing."""
+    diff = """
+--- a/service.py
++++ b/service.py
+@@ -1,2 +0,0 @@
+-def old_api():
+-    return 1
+"""
+    basis = RetirementBasis(target_symbols=("old_api",))
+    # Oversized file > 2_000_000 bytes
+    large_comment = "# " + ("A" * 100) + "\n"
+    oversized_content = "def old_api():\n    return 42\n" + (large_comment * 20_500)
+
+    ws = _make_workspace(
+        tmp_path / "ws_large",
+        {
+            "service.py": "# cleanly removed old_api\n",
+            "retained.py": oversized_content,
+        },
+    )
+
+    receipt = evaluate_diff_hygiene(diff, basis, workspace=ws)
+    assert receipt.verdict == "rejected"
+    assert any(
+        f.rule_id == "AE004-INSUFFICIENT_SOURCE_EVIDENCE" and "exceeds size limit" in f.message
+        for f in receipt.findings
+    )
+    assert receipt.retired_symbols == ()
+
+
+def test_workspace_scan_file_count_limit_fails_with_ae004(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify exceeding the workspace file-count limit blocks certification with AE004.
+
+    A truncated scan cannot prove absence: even when the diff cleanly removes
+    the target, an unvisited source file might still define it.
+    """
+    from loopx.capabilities.anti_entropy import oracles as ae_oracles
+
+    monkeypatch.setattr(ae_oracles, "_MAX_WORKSPACE_FILES", 2)
+
+    diff = """
+--- a/service.py
++++ b/service.py
+@@ -1,2 +0,0 @@
+-def old_api():
+-    return 1
+"""
+    basis = RetirementBasis(target_symbols=("old_api",))
+    ws = _make_workspace(
+        tmp_path / "ws_many",
+        {
+            "service.py": "# cleanly removed old_api\n",
+            "a.py": "alpha = 1\n",
+            "b.py": "beta = 2\n",
+            "c.py": "gamma = 3\n",
+        },
+    )
+
+    receipt = evaluate_diff_hygiene(diff, basis, workspace=ws)
+    assert receipt.verdict == "rejected"
+    assert any(
+        f.rule_id == "AE004-INSUFFICIENT_SOURCE_EVIDENCE"
+        and "file count exceeded limit" in f.message
+        for f in receipt.findings
+    )
+    assert receipt.retired_symbols == ()
+
+
+def test_typescript_class_method_retirement() -> None:
+    """Verify TypeScript class methods (public, async, etc.) are recognized when cleanly deleted."""
+    diff = """
+--- a/controller.ts
++++ b/controller.ts
+@@ -1,8 +1,2 @@
+ export class TaskController {
+-    public async oldTaskMethod(taskId: string): Promise<void> {
+-        return;
+-    }
+-    private helperCalc(): number { return 1; }
+     newTaskMethod(): void {}
+ }
+"""
+    basis = RetirementBasis(target_symbols=("oldTaskMethod", "helperCalc"))
+    receipt = evaluate_diff_hygiene(diff, basis)
+    assert any(f.rule_id == "AE004-INSUFFICIENT_SOURCE_EVIDENCE" for f in receipt.findings)
+    assert receipt.verdict == "rejected"
+
+
+def test_ghost_code_ignores_natural_language_and_headings() -> None:
+    """Verify plain words / title headings in comments do not trigger ghost code false positives."""
+    diff = """
+--- a/module.py
++++ b/module.py
+@@ -1,2 +1,6 @@
+ def compute():
++    # Overview
++    # Architecture
++    # Design
++    # Summary
+     return 1
+"""
+    receipt = evaluate_diff_hygiene(diff)
+    assert receipt.verdict == "passed"
+    assert len(receipt.findings) == 0
+
+
+def test_typescript_parenthesized_expression_is_not_function_def() -> None:
+    """Verify const x = (a + b) * c is not misclassified as a function definition."""
+    diff = """
+--- a/calc.ts
++++ b/calc.ts
+@@ -1,2 +1,3 @@
+ function run() {
++    const result = (a + b) * c;
+ }
+"""
+    basis = RetirementBasis(target_symbols=("result",))
+    receipt = evaluate_diff_hygiene(diff, basis)
+    assert receipt.verdict == "rejected"
+    assert any(f.rule_id == "AE004-INSUFFICIENT_SOURCE_EVIDENCE" for f in receipt.findings)
+    assert not any(f.rule_id == "AE002-ZOMBIE_SYMBOL_REINTRODUCED" for f in receipt.findings)

@@ -39,11 +39,21 @@ _TS_DEF_PATTERNS = [
     re.compile(
         r"^\s*(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*(?::[^=]+)?=\s*(?:async\s+)?function"
     ),
-    # const / let / var Foo = (multiline signature start)
+    # const / let / var Foo = async (
     re.compile(
-        r"^\s*(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*(?::[^=]+)?=\s*(?:async\s*)?(?:<[^>]*>)?\s*\("
+        r"^\s*(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*(?::[^=]+)?=\s*async\s*(?:<[^>]*>)?\s*\("
+    ),
+    # class methods / interface methods: e.g. public async oldMethod(param: string): void {
+    re.compile(
+        r"^\s*(?:(?:public|private|protected|readonly|override)\s+)*(?:static\s+)?(?:async\s+)?\*?\s*([A-Za-z_$][A-Za-z0-9_$]*)\s*(?:<[^>]*>)?\s*\([^)]*\)\s*(?::\s*[^{;]+)?\s*\{?"
     ),
 ]
+
+_TS_RESERVED_NAMES = {
+    "if", "for", "switch", "while", "catch", "constructor", "get", "set",
+    "function", "class", "export", "import", "return", "throw", "default",
+    "new", "typeof", "instanceof", "void", "delete", "yield", "await",
+}
 
 _COMMENT_LINE_RE = re.compile(r"^\s*(?:#|//)\s*(.+)$")
 
@@ -289,7 +299,9 @@ def _extract_ts_defs(lines: list[str]) -> set[str]:
         for pattern in _TS_DEF_PATTERNS:
             m = pattern.match(line)
             if m:
-                defs.add(m.group(1))
+                candidate = m.group(1)
+                if candidate not in _TS_RESERVED_NAMES:
+                    defs.add(candidate)
                 break
     return defs
 
@@ -304,20 +316,44 @@ def _strip_ts_line(line: str) -> str:
     return line
 
 
-def _extract_ts_refs(lines: list[str], defs: set[str]) -> set[str]:
-    """Word-level references for TS/JS-like lines, excluding definition lines themselves."""
+def _extract_ts_refs(
+    lines: list[str],
+    target_symbols: set[str],
+) -> set[str]:
+    """Extract real references to target symbols in TS/JS-like lines.
+
+    Strips comments and string-literal spans, then searches for whole-word identifier
+    matches. Definition lines only exclude the declared symbol identifier at its definition
+    site; cross-file imports, member calls (e.g. api.old_api()), and arrow expressions
+    referencing target_symbols are recorded as active references.
+    """
     refs: set[str] = set()
-    for line in lines:
-        line_clean = line.strip()
-        is_def_line = any(
-            (m := pattern.match(line_clean)) and m.group(1) in defs
-            for pattern in _TS_DEF_PATTERNS
-        )
-        if is_def_line:
+    if not target_symbols:
+        return refs
+
+    for raw_line in lines:
+        stripped = _strip_ts_line(raw_line)
+        if not stripped.strip():
             continue
-        for word in re.findall(r"[A-Za-z_$][A-Za-z0-9_$]*", _strip_ts_line(line)):
-            if word in defs:
-                refs.add(word)
+
+        defined_on_line: str | None = None
+        for pattern in _TS_DEF_PATTERNS:
+            m = pattern.match(raw_line.strip())
+            if m:
+                candidate = m.group(1)
+                if candidate in target_symbols and candidate not in _TS_RESERVED_NAMES:
+                    defined_on_line = candidate
+                break
+
+        line_for_refs = stripped
+        if defined_on_line:
+            line_for_refs = re.sub(r"\b" + re.escape(defined_on_line) + r"\b", "", line_for_refs, count=1)
+
+        words = set(re.findall(r"[A-Za-z_$][A-Za-z0-9_$]*", line_for_refs))
+        for s in target_symbols:
+            if s in words:
+                refs.add(s)
+
     return refs
 
 
@@ -365,7 +401,7 @@ class _DiffSymbolAnalysis:
     deleted_paths: set[str] = field(default_factory=set)
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class _WorkspaceEvidence:
     """Complete post-change source evidence bound to an explicitly given workspace."""
 
@@ -373,6 +409,9 @@ class _WorkspaceEvidence:
     defined_symbols: dict[str, set[str]] = field(default_factory=dict)
     referenced_symbols: dict[str, set[str]] = field(default_factory=dict)
     existing_paths: set[str] = field(default_factory=set)
+    scan_incomplete: bool = False
+    incomplete_reason: str = ""
+    skipped_files: tuple[str, ...] = ()
 
 
 def _extract_python_refs_from_code(code: str) -> set[str] | None:
@@ -410,24 +449,39 @@ def _scan_workspace(workspace: Path, symbols: tuple[str, ...]) -> _WorkspaceEvid
     symbol_set = set(symbols)
     source_exts = _PY_EXTENSIONS | _TS_EXTENSIONS
     visited = 0
+    skipped: list[str] = []
+
     for dirpath, dirnames, filenames in os.walk(workspace):
         dirnames[:] = [d for d in dirnames if d not in _WORKSPACE_SKIP_DIRS]
         for filename in filenames:
-            if visited >= _MAX_WORKSPACE_FILES:
-                return evidence
             file_path = Path(dirpath) / filename
             if file_path.suffix.lower() not in source_exts:
                 continue
+            rel = file_path.relative_to(workspace).as_posix()
+            if visited >= _MAX_WORKSPACE_FILES:
+                evidence.scan_incomplete = True
+                evidence.incomplete_reason = f"Workspace source file count exceeded limit ({_MAX_WORKSPACE_FILES} files)"
+                skipped.append(rel)
+                evidence.skipped_files = tuple(skipped)
+                return evidence
             try:
-                if file_path.stat().st_size > _MAX_SOURCE_FILE_BYTES:
+                size = file_path.stat().st_size
+                if size > _MAX_SOURCE_FILE_BYTES:
+                    evidence.scan_incomplete = True
+                    evidence.incomplete_reason = f"Source file '{rel}' exceeds size limit ({_MAX_SOURCE_FILE_BYTES} bytes)"
+                    skipped.append(rel)
                     continue
                 content = file_path.read_text(encoding="utf-8")
-            except (OSError, UnicodeDecodeError):
+            except (OSError, UnicodeDecodeError) as exc:
+                evidence.scan_incomplete = True
+                evidence.incomplete_reason = f"Failed to read source file '{rel}': {exc}"
+                skipped.append(rel)
                 continue
+
             visited += 1
             if not any(s in content for s in symbol_set):
                 continue
-            rel = file_path.relative_to(workspace).as_posix()
+
             ext = file_path.suffix.lower()
             if ext in _PY_EXTENSIONS:
                 defs = _extract_python_defs_from_code(content)
@@ -442,12 +496,15 @@ def _scan_workspace(workspace: Path, symbols: tuple[str, ...]) -> _WorkspaceEvid
             else:
                 content_lines = content.splitlines()
                 defs = _extract_ts_defs(content_lines)
-                refs = _extract_ts_refs(content_lines, defs)
+                refs = _extract_ts_refs(content_lines, symbol_set)
+
             for s in symbol_set:
                 if s in defs:
                     evidence.defined_symbols.setdefault(s, set()).add(rel)
                 if s in refs:
                     evidence.referenced_symbols.setdefault(s, set()).add(rel)
+
+    evidence.skipped_files = tuple(skipped)
     return evidence
 
 
@@ -620,6 +677,21 @@ def _verify_symbol_targets(
                         f"Target symbol '{symbol}' cannot be certified as retired: no source "
                         "workspace was bound. Pass an explicit workspace containing the complete "
                         "post-change sources; a diff alone does not prove definition removal."
+                    ),
+                    location=symbol,
+                )
+            )
+            continue
+
+        if workspace_evidence.scan_incomplete:
+            findings.append(
+                AntiEntropyFinding(
+                    rule_id=_RULE_AE004,
+                    severity="blocking",
+                    message=(
+                        f"Target symbol '{symbol}' cannot be certified as retired: workspace scan is "
+                        f"incomplete ({workspace_evidence.incomplete_reason}). Complete post-change "
+                        "source evidence is required."
                     ),
                     location=symbol,
                 )
@@ -865,8 +937,17 @@ def audit_ghost_code(diff_text: str) -> list[AntiEntropyFinding]:
                     is_code_stmt = True
                 else:
                     try:
-                        ast.parse(comment_content)
-                        is_code_stmt = True
+                        parsed = ast.parse(comment_content)
+                        if len(parsed.body) == 1 and isinstance(parsed.body[0], ast.Expr):
+                            val = parsed.body[0].value
+                            if isinstance(val, (ast.Name, ast.Constant)):
+                                is_code_stmt = False
+                            elif isinstance(val, ast.Tuple) and all(isinstance(elt, (ast.Name, ast.Constant)) for elt in val.elts):
+                                is_code_stmt = False
+                            else:
+                                is_code_stmt = True
+                        else:
+                            is_code_stmt = True
                     except SyntaxError:
                         is_code_stmt = False
 

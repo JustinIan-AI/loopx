@@ -61,10 +61,14 @@ Verification distinguishes diff-visible facts from workspace-derived facts:
 The capability ships disabled (`default_enabled: false`); enabling it for a
 task is an explicit choice. When enabled, one closed loop per task is:
 
-1. **Task context** — `build_anti_entropy_turn_context(basis, goal_id,
-   workspace)` projects the declared `RetirementBasis` into a typed
-   turn-context payload a host can inject into agent input. Building the
-   payload executes nothing.
+1. **Task context** — `anti_entropy_context_registration` is composed into
+   the shared `loopx.capabilities.turn_context.attach_turn_context` owner:
+   a turn whose task declares a `RetirementBasis` (or explicitly enables the
+   capability) receives the targets, the inspect tool, and delete-first
+   guidance in its host input; disabled turns get zero injection, and
+   enabled-but-inapplicable turns only read back `enabled/applicable=false`.
+   Recovery turns (the payload carries the previous inspect outcome) get
+   remediation guidance instead.
 2. **In-flight check** — agents call the `anti_entropy_inspect` tool (or
    `loopx anti-entropy inspect`). Blocking findings come back as
    **actionable feedback with per-rule next actions**, classified as progress
@@ -127,7 +131,7 @@ no model runs and measures no agent-runtime behavior.
 
 ## Boundaries
 
-- The capability is default-off and operates as an opt-in code hygiene verifier via CLI and typed receipts.
+- The capability is default-off and task-scoped: turns receive the retirement context only when the task explicitly declares a retirement basis or enables the capability; the CLI (verify/inspect) remains the shared verification entry.
 - Delete-first requires target old logic to be cleanly decommissioned in the diff without re-introducing wrappers or zombie symbols.
 - Symbol retirement certification requires an explicitly bound workspace; diff-only evidence can reject but never certifies.
 - AST-based diff hygiene verifies exact code diffs without mutating repository code or performing speculative git writes.

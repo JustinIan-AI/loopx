@@ -122,6 +122,41 @@ def _render(payload: dict[str, Any]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _read_diff_text(args: argparse.Namespace) -> str:
+    if args.diff_file == "-":
+        return sys.stdin.read()
+    if args.diff_file:
+        diff_path = Path(args.diff_file).expanduser()
+        if diff_path.is_file():
+            return diff_path.read_text(encoding="utf-8")
+        raise ValueError(f"diff file not found: {args.diff_file}")
+    return ""
+
+
+def _read_basis_data(args: argparse.Namespace) -> Any:
+    if args.basis_json is None:
+        return None
+    raw_basis = args.basis_json.strip()
+    if raw_basis.startswith("{") or raw_basis.startswith("["):
+        return json.loads(raw_basis)
+    path = Path(raw_basis).expanduser()
+    if path.is_file():
+        return json.loads(path.read_text(encoding="utf-8"))
+    try:
+        return json.loads(raw_basis)
+    except Exception:
+        raise ValueError(f"basis file not found: {raw_basis}")
+
+
+def _resolve_workspace(args: argparse.Namespace) -> Path | None:
+    if not getattr(args, "workspace", None):
+        return None
+    workspace = Path(args.workspace).expanduser().resolve()
+    if not workspace.is_dir():
+        raise ValueError(f"workspace directory not found: {args.workspace}")
+    return workspace
+
+
 def handle_anti_entropy_command(
     args: argparse.Namespace,
     *,
@@ -134,38 +169,13 @@ def handle_anti_entropy_command(
         return None
     try:
         command = args.anti_entropy_command
+        # Shared input reading: both entries bind the same diff, basis, and
+        # post-change workspace; only the outcome contract differs.
+        diff_text = _read_diff_text(args)
+        basis_data = _read_basis_data(args)
+        workspace = _resolve_workspace(args)
+
         if command == "verify":
-            diff_text = ""
-            if args.diff_file == "-":
-                diff_text = sys.stdin.read()
-            elif args.diff_file:
-                diff_path = Path(args.diff_file).expanduser()
-                if diff_path.is_file():
-                    diff_text = diff_path.read_text(encoding="utf-8")
-                else:
-                    raise ValueError(f"diff file not found: {args.diff_file}")
-
-            basis_data = None
-            if args.basis_json is not None:
-                raw_basis = args.basis_json.strip()
-                if raw_basis.startswith("{") or raw_basis.startswith("["):
-                    basis_data = json.loads(raw_basis)
-                else:
-                    path = Path(raw_basis).expanduser()
-                    if path.is_file():
-                        basis_data = json.loads(path.read_text(encoding="utf-8"))
-                    else:
-                        try:
-                            basis_data = json.loads(raw_basis)
-                        except Exception:
-                            raise ValueError(f"basis file not found: {raw_basis}")
-
-            workspace: Path | None = None
-            if getattr(args, "workspace", None):
-                workspace = Path(args.workspace).expanduser().resolve()
-                if not workspace.is_dir():
-                    raise ValueError(f"workspace directory not found: {args.workspace}")
-
             payload = run_anti_entropy_verify(
                 diff_text=diff_text,
                 basis_data=basis_data,
@@ -173,37 +183,6 @@ def handle_anti_entropy_command(
                 workspace=workspace,
             )
         elif command == "inspect":
-            diff_text = ""
-            if args.diff_file == "-":
-                diff_text = sys.stdin.read()
-            elif args.diff_file:
-                diff_path = Path(args.diff_file).expanduser()
-                if diff_path.is_file():
-                    diff_text = diff_path.read_text(encoding="utf-8")
-                else:
-                    raise ValueError(f"diff file not found: {args.diff_file}")
-
-            basis_data = None
-            if args.basis_json is not None:
-                raw_basis = args.basis_json.strip()
-                if raw_basis.startswith("{") or raw_basis.startswith("["):
-                    basis_data = json.loads(raw_basis)
-                else:
-                    path = Path(raw_basis).expanduser()
-                    if path.is_file():
-                        basis_data = json.loads(path.read_text(encoding="utf-8"))
-                    else:
-                        try:
-                            basis_data = json.loads(raw_basis)
-                        except Exception:
-                            raise ValueError(f"basis file not found: {raw_basis}")
-
-            workspace = None
-            if getattr(args, "workspace", None):
-                workspace = Path(args.workspace).expanduser().resolve()
-                if not workspace.is_dir():
-                    raise ValueError(f"workspace directory not found: {args.workspace}")
-
             from ..capabilities.anti_entropy.feedback import run_anti_entropy_feedback_cycle
 
             payload = run_anti_entropy_feedback_cycle(

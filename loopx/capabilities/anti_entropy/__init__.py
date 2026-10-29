@@ -21,6 +21,10 @@ from .oracles import (
     evaluate_diff_hygiene,
     verify_delete_first,
 )
+from .turn_context import (
+    anti_entropy_context_registration,
+    anti_entropy_context_result,
+)
 
 __all__ = [
     "ANTI_ENTROPY_CAPABILITY_ID",
@@ -38,4 +42,6 @@ __all__ = [
     "run_anti_entropy_feedback_cycle",
     "run_anti_entropy_verify",
     "verify_delete_first",
+    "anti_entropy_context_registration",
+    "anti_entropy_context_result",
 ]
