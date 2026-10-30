@@ -70,9 +70,11 @@ task is an explicit choice. When enabled, one closed loop per task is:
      task body when the compact display text was truncated), plus
      `turn_envelope.action.selected_todo.text` / `action.recommended_action`;
    - a task opts in by declaring an explicit `retirement_basis` /
-     `anti_entropy_basis` JSON object in that text, by listing
-     `anti-entropy-governance` in the Todo's `required_capabilities`, or by a
-     Goal-level available-capability declaration;
+     `anti_entropy_basis` JSON object in that text. A Todo may also list
+     `anti-entropy-governance` in `required_capabilities`, but only when the
+     Goal already declares that capability available: otherwise routing treats
+     the Todo as requiring an unavailable capability and the Turn stops before
+     the hook, so the explicit task declaration is the primary path;
    - the post-change workspace is the Goal repository from the registry
      (`load_goal_from_registry`), never the process working directory.
 
