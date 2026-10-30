@@ -306,6 +306,58 @@ def _extract_ts_defs(lines: list[str]) -> set[str]:
     return defs
 
 
+_TS_IDENTIFIER_RE = re.compile(r"[A-Za-z_$][A-Za-z0-9_$]*\Z")
+_TS_QUOTE_CHARS = ("\"", "'", chr(96))
+
+
+def _static_computed_member(
+    text: str, start: int, out: list[str]
+) -> tuple[str, int] | None:
+    """Preserve a statically named computed member access (api[name]).
+
+    Only a member name in a value position is preserved. Array literals,
+    declarations, and dynamic expressions stay string-literal text and never
+    become executable references; unparseable forms keep the normal string
+    handling so they cannot be certified as absent evidence.
+    """
+    index = start + 1
+    length = len(text)
+    while index < length and text[index] in " \t":
+        index += 1
+    if index >= length or text[index] not in _TS_QUOTE_CHARS:
+        return None
+    quote = text[index]
+    cursor = index + 1
+    content_start = cursor
+    while cursor < length:
+        char = text[cursor]
+        if char == "\\" or char == "\n":
+            return None
+        if char == quote:
+            break
+        cursor += 1
+    if cursor >= length:
+        return None
+    name = text[content_start:cursor]
+    if not _TS_IDENTIFIER_RE.match(name):
+        return None
+    after = cursor + 1
+    while after < length and text[after] in " \t":
+        after += 1
+    if after >= length or text[after] != "]":
+        return None
+    previous = ""
+    for position in range(len(out) - 1, -1, -1):
+        token = out[position]
+        stripped = token.rstrip()
+        if stripped:
+            previous = stripped[-1]
+            break
+    if not (previous.isalnum() or previous in "_$)]."):
+        return None
+    return name, after + 1
+
+
 def _tokenize_ts_code(text: str) -> tuple[str, bool]:
     """Tokenize and strip comments and string-literal spans from TS/JS code.
 
@@ -323,6 +375,14 @@ def _tokenize_ts_code(text: str) -> tuple[str, bool]:
     stack: list[Any] = []  # items: 'template' or {'type': 'expr', 'brace_depth': int}
 
     while i < n:
+        if text[i] == "[" and (not stack or stack[-1] != "template"):
+            computed = _static_computed_member(text, i, out)
+            if computed is not None:
+                name, next_index = computed
+                out.append(" ")
+                out.append(name)
+                i = next_index
+                continue
         if not stack:
             # Top-level code
             if text[i : i + 2] == "//":

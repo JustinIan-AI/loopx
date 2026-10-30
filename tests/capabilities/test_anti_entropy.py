@@ -405,6 +405,45 @@ def test_cli_exit_code_and_subprocess(tmp_path: Path) -> None:
     )
     assert proc_ws.returncode == 2
 
+    # 5. verify without any basis -> input error, never a silent pass
+    proc_no_basis = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "loopx.cli",
+            "anti-entropy",
+            "verify",
+            "--diff-file",
+            "-",
+            "--format",
+            "json",
+        ],
+        input=b"",
+        capture_output=True,
+    )
+    assert proc_no_basis.returncode == 2
+    assert b"retirement basis" in proc_no_basis.stderr
+
+    # 6. verify with a basis that declares no retirement target -> input error
+    proc_no_target = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "loopx.cli",
+            "anti-entropy",
+            "verify",
+            "--diff-file",
+            "-",
+            "--basis-json",
+            "{}",
+            "--format",
+            "json",
+        ],
+        input=b"",
+        capture_output=True,
+    )
+    assert proc_no_target.returncode == 2
+
 
 def test_docstring_example_deletion_does_not_retire_real_definition(tmp_path: Path) -> None:
     """Verify deleting a code example in a docstring does not falsely pass a retained real definition."""
@@ -1133,3 +1172,73 @@ def test_typescript_unclosed_syntax_reports_insufficient_evidence(tmp_path: Path
     assert receipt.verdict == "rejected"
     assert any(f.rule_id.startswith("AE004") for f in receipt.findings)
     assert "old_api" not in receipt.retired_symbols
+
+def test_typescript_static_computed_member_reference_blocks_retirement(
+    tmp_path: Path,
+) -> None:
+    """A statically named computed member access is an active reference."""
+    diff = """
+--- a/service.mjs
++++ b/service.mjs
+@@ -1,2 +1,2 @@
+-export function old_api() { return 1; }
++export function new_api() { return 2; }
+"""
+    basis = RetirementBasis(target_symbols=("old_api",))
+    workspace = _make_workspace(
+        tmp_path / "ws_unmigrated",
+        {
+            "service.mjs": "export function new_api() { return 2; }\n",
+            "client.mjs": (
+                "import * as api from './service.mjs';\n"
+                "const first = api['old_api']();\n"
+                'const second = api?.["old_api"]();\n'
+            ),
+        },
+    )
+
+    receipt = evaluate_diff_hygiene(diff, basis, workspace=workspace)
+    assert receipt.verdict == "rejected"
+    assert any(
+        finding.rule_id == "AE002-ZOMBIE_SYMBOL_REINTRODUCED"
+        and "client.mjs" in finding.message
+        for finding in receipt.findings
+    )
+    assert receipt.retired_symbols == ()
+
+
+def test_typescript_computed_member_migrated_and_harmless_strings_pass(
+    tmp_path: Path,
+) -> None:
+    """Migrated computed calls and plain string/array text never block retirement."""
+    diff = """
+--- a/service.mjs
++++ b/service.mjs
+@@ -1,2 +1,2 @@
+-export function old_api() { return 1; }
++export function new_api() { return 2; }
+--- a/client.mjs
++++ b/client.mjs
+@@ -2,1 +2,3 @@
+-export function run() { return api.old_api(); }
++export function run() { return api['new_api'](); }
++export const allowed = ['old_api'];
++export const message = "old_api has been removed";
+"""
+    basis = RetirementBasis(target_symbols=("old_api",))
+    workspace = _make_workspace(
+        tmp_path / "ws_migrated",
+        {
+            "service.mjs": "export function new_api() { return 2; }\n",
+            "client.mjs": (
+                "import * as api from './service.mjs';\n"
+                "export function run() { return api['new_api'](); }\n"
+                "export const allowed = ['old_api'];\n"
+                'export const message = "old_api has been removed";\n'
+            ),
+        },
+    )
+
+    receipt = evaluate_diff_hygiene(diff, basis, workspace=workspace)
+    assert receipt.verdict == "passed", f"findings: {receipt.findings}"
+    assert receipt.retired_symbols == ("old_api",)

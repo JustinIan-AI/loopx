@@ -8,7 +8,10 @@ from pathlib import Path
 from typing import Any
 
 from ..capabilities.anti_entropy.cli import run_anti_entropy_verify
-from ..capabilities.anti_entropy.contract import ANTI_ENTROPY_CAPABILITY_ID
+from ..capabilities.anti_entropy.contract import (
+    ANTI_ENTROPY_CAPABILITY_ID,
+    RetirementBasis,
+)
 
 PrintPayload = Callable[
     [dict[str, Any], str, Callable[[dict[str, Any]], str]], str | None
@@ -176,6 +179,20 @@ def handle_anti_entropy_command(
         workspace = _resolve_workspace(args)
 
         if command == "verify":
+            # A delivery-gate verification without a declared retirement basis
+            # would pass without checking anything; diff hygiene alone belongs
+            # to inspect and can never certify a retirement.
+            if basis_data is None:
+                raise ValueError(
+                    "verify requires an explicit retirement basis "
+                    "(--basis-json <json|path>)"
+                )
+            declared_basis = RetirementBasis.from_dict(basis_data)
+            if not declared_basis.target_symbols and not declared_basis.target_paths:
+                raise ValueError(
+                    "verify requires at least one declared retirement target "
+                    "(target_symbols or target_paths)"
+                )
             payload = run_anti_entropy_verify(
                 diff_text=diff_text,
                 basis_data=basis_data,

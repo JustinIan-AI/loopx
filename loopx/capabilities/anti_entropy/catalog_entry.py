@@ -31,7 +31,8 @@ ANTI_ENTROPY_CATALOG_ENTRY: dict[str, Any] = {
         "re-introducing wrappers, zombie symbols, or ghost code."
     ),
     "entry_command": (
-        "loopx anti-entropy inspect --goal-id <goal-id> --diff-file <diff.patch> --workspace <sources> --format json"
+        "loopx anti-entropy inspect --goal-id <goal-id> --diff-file <diff.patch> "
+        "--basis-json <json|path> --workspace <sources> --format json"
     ),
     "workflow_skill": {
         "name": "loopx-anti-entropy",
@@ -90,7 +91,9 @@ ANTI_ENTROPY_CATALOG_ENTRY: dict[str, Any] = {
     "docs": [_README],
     "boundaries": [
         "The capability is default-off and task-scoped: a turn receives the retirement context only when the task explicitly declares a retirement basis or enables the capability; disabled turns get zero injection.",
-        "The turn-context hook projects declared targets, the inspect tool, and delete-first guidance into host input via the shared attach_turn_context composition; it grants no execution authority.",
+        "The turn-context hook projects declared targets, the inspect descriptor, and delete-first guidance into host input via the shared attach_turn_context composition; it grants no execution authority.",
+        "Task intent comes from the selected Todo's own instruction/note text or an explicit capability id in its required capabilities; the post-change workspace is the Goal repository, never the process working directory.",
+        "LoopX has no capability-owned host tool registry: the inspect descriptor is projected as turn-context data, and the CLI (or the Python entry it wraps) remains the callable route.",
         "The CLI (verify/inspect) remains the shared verification entry for humans and agents; final delivery acceptance is owned by the existing change-quality prepare/record/verify owner.",
         "Delete-first requires target old logic to be cleanly decommissioned in the diff without re-introducing wrappers or zombie symbols.",
         "AST-based diff hygiene verifies exact code diffs without mutating repository code or performing speculative git writes.",
@@ -100,6 +103,7 @@ ANTI_ENTROPY_CATALOG_ENTRY: dict[str, Any] = {
         "Inspired by and adopting core engineering principles of delete-first code retirement from Aegis.",
     ],
     "next_real_step": (
-        "Run verification: loopx anti-entropy verify --diff-file <path> --basis-json <json>"
+        "Run verification: loopx anti-entropy verify --diff-file <path> "
+        "--basis-json <json|path> --workspace <post-change-sources> --format json"
     ),
 }

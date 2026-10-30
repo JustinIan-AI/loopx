@@ -386,7 +386,8 @@ def test_turn_context_hook_lifecycle_all_states(tmp_path: Path) -> None:
     res_disabled = anti_entropy_context_result(
         payload_disabled, goal_id="g-1", decision=decision_disabled
     )
-    assert res_disabled["readback"]["anti_entropy_guidance"] is None
+    # Disabled turns declare no readback slot: the host payload is untouched.
+    assert res_disabled["readback"] == {}
     assert res_disabled["context_fields"] == {}
     assert res_disabled["instructions"] == []
 
@@ -646,3 +647,254 @@ def test_turn_context_extracts_native_route_and_envelope_selected_todos() -> Non
     res_note = anti_entropy_context_result(payload_note, goal_id="g1", decision={})
     assert res_note["readback"]["anti_entropy_guidance"]["status"] == "active"
     assert res_note["readback"]["anti_entropy_guidance"]["target_symbols"] == ["old_note_func"]
+
+def test_turn_context_reads_native_work_context_todo_note() -> None:
+    """The hook reads the selected Todo's canonical note from the native work context."""
+    basis = {
+        "retirement_basis": {
+            "target_symbols": ["old_api"],
+            "rationale": "replace old_api with new_api",
+        }
+    }
+    payload = {
+        "goal_id": "g1",
+        "route": {"selected_todo": {"todo_id": "t1"}},
+        "turn_envelope": {
+            "action": {
+                "recommended_action": "Replace old_api with new_api",
+                "selected_todo": {
+                    "todo_id": "t1",
+                    "text_ref": "action.recommended_action",
+                },
+            },
+            "work_context": {
+                "complete": True,
+                "sources": [
+                    {
+                        "source": "selected_todo",
+                        "content": {
+                            "todo": {
+                                "todo_id": "t1",
+                                "note": json.dumps(basis),
+                                "required_capabilities": ["anti-entropy-governance"],
+                            }
+                        },
+                    }
+                ],
+            },
+        },
+    }
+    res = anti_entropy_context_result(payload, goal_id="g1", decision={})
+    guidance = res["readback"]["anti_entropy_guidance"]
+    assert guidance["enabled"] is True
+    assert guidance["applicable"] is True
+    assert guidance["target_symbols"] == ["old_api"]
+    assert "anti_entropy_context" in res["context_fields"]
+    assert res["context_fields"]["anti_entropy_context"]["inspect_tool"]["name"] == (
+        "anti_entropy_inspect"
+    )
+    assert any("delete-first" in item.lower() for item in res["instructions"])
+
+
+def test_turn_context_reads_basis_from_action_recommended_action() -> None:
+    """A retirement declaration inside the task body is read from the native action."""
+    instruction = (
+        "Replace the legacy API and remove the old export.\n"
+        '{"retirement_basis": {"target_symbols": ["old_api"], "target_paths": []}}'
+    )
+    payload = {
+        "turn_envelope": {
+            "action": {
+                "recommended_action": instruction,
+                "selected_todo": {
+                    "todo_id": "t1",
+                    "text_ref": "action.recommended_action",
+                },
+            }
+        }
+    }
+    res = anti_entropy_context_result(payload, goal_id="g1", decision={})
+    guidance = res["readback"]["anti_entropy_guidance"]
+    assert guidance["applicable"] is True
+    assert guidance["target_symbols"] == ["old_api"]
+
+
+def test_turn_context_ignores_unrelated_json_in_task_text() -> None:
+    """Unrelated JSON in a task body does not opt a turn into retirement governance."""
+    payload = {
+        "turn_envelope": {
+            "action": {
+                "recommended_action": 'Set {"timeout": 30} for the nightly run.',
+                "selected_todo": {"todo_id": "t1", "text_ref": "action.recommended_action"},
+            }
+        }
+    }
+    res = anti_entropy_context_result(payload, goal_id="g1", decision={})
+    assert res["readback"] == {}
+    assert res["context_fields"] == {}
+
+
+def test_disabled_turn_writes_no_readback_slot(tmp_path: Path) -> None:
+    """A disabled turn declares no slot and leaves the host payload untouched."""
+    from loopx.capabilities.anti_entropy.turn_context import (
+        anti_entropy_context_registration,
+    )
+    from loopx.control_plane.capability_hooks import dispatch_turn_context_hooks
+
+    payload = {"goal_id": "g1", "agent_id": "a1"}
+    registration = anti_entropy_context_registration(
+        payload,
+        registry_path=tmp_path,
+        goal_id="g1",
+        agent_id="a1",
+        decision={},
+        turn_instance_id="t1",
+    )
+    assert registration.readback_slots == ()
+    dispatched = dict(payload)
+    dispatch_turn_context_hooks(dispatched, (registration,))
+    assert "anti_entropy_guidance" not in dispatched
+    assert "turn_context_contributions" not in dispatched
+
+
+def test_turn_context_resolves_workspace_from_goal_registry(tmp_path: Path) -> None:
+    """The post-change workspace is the Goal repository, never the process CWD."""
+    from loopx.capabilities.anti_entropy.turn_context import (
+        anti_entropy_context_registration,
+    )
+    from loopx.control_plane.capability_hooks import (
+        dispatch_turn_context_hooks,
+        project_turn_context,
+    )
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    registry = tmp_path / "registry.json"
+    registry.write_text(
+        json.dumps({"goals": [{"id": "g1", "repo": str(repo)}]}), encoding="utf-8"
+    )
+    payload = {
+        "goal_id": "g1",
+        "agent_id": "a1",
+        "retirement_basis": {"target_symbols": ["old_api"]},
+    }
+    registration = anti_entropy_context_registration(
+        payload,
+        registry_path=registry,
+        goal_id="g1",
+        agent_id="a1",
+        decision={},
+        turn_instance_id="t1",
+    )
+    dispatched = dict(payload)
+    dispatch_turn_context_hooks(dispatched, (registration,))
+    guidance = dispatched["anti_entropy_guidance"]
+    assert guidance["workspace_available"] is True
+    context = project_turn_context(dispatched)["anti_entropy_context"]
+    assert context["workspace"] == str(repo.resolve())
+
+
+def _native_turn_decision_fixture() -> dict:
+    """Load the canonical Turn decision fixture used by the envelope tests."""
+    import importlib.util
+
+    fixture_path = Path(__file__).resolve().parents[1] / "test_turn_envelope.py"
+    spec = importlib.util.spec_from_file_location(
+        "_anti_entropy_turn_envelope_fixture", fixture_path
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module._full_decision()
+
+
+def _dispatch_native_turn_plan(source: dict, registry: Path) -> dict:
+    """Build the real TS-owned Turn envelope, then dispatch the shared composer."""
+    from loopx.capabilities.anti_entropy.turn_context import (
+        anti_entropy_context_registration,
+    )
+    from loopx.control_plane.capability_hooks import dispatch_turn_context_hooks
+    from loopx.control_plane.quota.turn_envelope import build_turn_envelope
+
+    envelope = build_turn_envelope(source)
+    plan = {
+        "turn_envelope": envelope,
+        "route": {"selected_todo": envelope["action"]["selected_todo"]},
+    }
+    registration = anti_entropy_context_registration(
+        plan,
+        registry_path=registry,
+        goal_id="fixture-goal",
+        agent_id="codex-fixture",
+        decision=source,
+        turn_instance_id="t1",
+    )
+    dispatch_turn_context_hooks(plan, (registration,))
+    return plan
+
+
+def test_native_turn_envelope_work_context_note_reaches_host_input(
+    tmp_path: Path,
+) -> None:
+    """The real Turn envelope carries the Todo note into host input."""
+    from loopx.control_plane.capability_hooks import project_turn_context
+
+    source = _native_turn_decision_fixture()
+    source["interaction_contract"]["agent_channel"]["work_context"] = {
+        "complete": True,
+        "selected_todo_ref": "selected_todo",
+        "sources": [
+            {
+                "source": "selected_todo",
+                "content": {
+                    "todo": {
+                        "todo_id": "todo_fixture0001",
+                        "note": json.dumps(
+                            {"retirement_basis": {"target_symbols": ["old_api"]}}
+                        ),
+                        "required_capabilities": ["anti-entropy-governance"],
+                    }
+                },
+            }
+        ],
+        "instruction": "Read current sources before work.",
+    }
+
+    plan = _dispatch_native_turn_plan(source, tmp_path)
+
+    assert "turn_context_hook_failures" not in plan
+    guidance = plan["anti_entropy_guidance"]
+    assert guidance["enabled"] is True
+    assert guidance["applicable"] is True
+    assert guidance["target_symbols"] == ["old_api"]
+    projected = project_turn_context(plan)
+    assert "anti_entropy_context" in projected["capability_context_fields"]
+    assert any(
+        "delete-first" in item.lower()
+        for item in projected["capability_instructions"]
+    )
+
+
+def test_native_turn_envelope_task_text_reaches_host_input(tmp_path: Path) -> None:
+    """The task body carried by the native action is an intent source too."""
+    from loopx.control_plane.capability_hooks import project_turn_context
+
+    source = _native_turn_decision_fixture()
+    source["selected_todo"]["text"] = (
+        "Replace old_api with new_api. "
+        + json.dumps({"retirement_basis": {"target_symbols": ["old_api"]}})
+    )
+    source["interaction_contract"]["agent_channel"]["work_context"] = {
+        "complete": True,
+        "selected_todo_ref": "selected_todo",
+        "instruction": "Read current sources before work.",
+    }
+
+    plan = _dispatch_native_turn_plan(source, tmp_path)
+
+    # The envelope elides a redundant work context and keeps the body in action.
+    assert "work_context" not in plan["turn_envelope"]
+    guidance = plan["anti_entropy_guidance"]
+    assert guidance["applicable"] is True
+    assert guidance["target_symbols"] == ["old_api"]
+    projected = project_turn_context(plan)
+    assert "anti_entropy_context" in projected["capability_context_fields"]

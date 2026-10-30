@@ -62,17 +62,31 @@ The capability ships disabled (`default_enabled: false`); enabling it for a
 task is an explicit choice. When enabled, one closed loop per task is:
 
 1. **Task context** — `anti_entropy_context_registration` is composed into
-   the shared `loopx.capabilities.turn_context.attach_turn_context` owner:
-   a turn whose task declares a `RetirementBasis` (or explicitly enables the
-   capability) receives the targets, the inspect tool, and delete-first
-   guidance in its host input; disabled turns get zero injection, and
-   enabled-but-inapplicable turns only read back `enabled/applicable=false`.
+   the shared `loopx.capabilities.turn_context.attach_turn_context` owner and
+   reads the Turn's own authoritative input, never a hand-built payload shape:
+
+   - the selected Todo record carried by `turn_envelope.work_context.sources[]`
+     (its `note` / instruction text, `required_capabilities`, and the full
+     task body when the compact display text was truncated), plus
+     `turn_envelope.action.selected_todo.text` / `action.recommended_action`;
+   - a task opts in by declaring an explicit `retirement_basis` /
+     `anti_entropy_basis` JSON object in that text, by listing
+     `anti-entropy-governance` in the Todo's `required_capabilities`, or by a
+     Goal-level available-capability declaration;
+   - the post-change workspace is the Goal repository from the registry
+     (`load_goal_from_registry`), never the process working directory.
+
+   Disabled turns write no readback slot and inject nothing; an
+   enabled-but-inapplicable turn only reads back `enabled/applicable=false`.
    Recovery turns (the payload carries the previous inspect outcome) get
    remediation guidance instead.
-2. **In-flight check** — agents call the `anti_entropy_inspect` tool (or
-   `loopx anti-entropy inspect`). Blocking findings come back as
-   **actionable feedback with per-rule next actions**, classified as progress
-   facts, not final delivery failures; the CLI exits 0 whenever the check ran.
+2. **In-flight check** — agents call `anti_entropy_inspect` through the Python
+   entry or `loopx anti-entropy inspect`. The turn context carries the tool
+   descriptor and CLI route as data; LoopX exposes no capability-owned host
+   tool registry, so the CLI remains the callable route. Blocking findings come
+   back as **actionable feedback with per-rule next actions**, classified as
+   progress facts, not final delivery failures; the CLI exits 0 whenever the
+   check ran.
 3. **Delivery verification** — final acceptance stays owned by the existing
    change-quality owner (`loopx change-quality prepare/record/verify`, exact
    diff scope and receipt invalidation). This capability supplies evidence and
@@ -105,11 +119,16 @@ In-flight inspection with actionable feedback (progress-fact semantics):
 loopx anti-entropy inspect --goal-id <goal-id> --diff-file <diff.patch> --basis-json <basis.json> --workspace <sources> --format json
 ```
 
-Delivery-gate verification (non-zero exit on rejection):
+Delivery-gate verification (non-zero exit on rejection). `verify` requires an
+explicit basis with at least one target, and certifies symbol retirement only
+when `--workspace` is bound:
 
 ```bash
 loopx anti-entropy verify --goal-id <goal-id> --diff-file <diff.patch> --basis-json <basis.json> --workspace <sources> --format json
 ```
+
+`verify` without `--basis-json` (or with an empty target set) exits 2: an
+undeclared retirement is an input error, not a passing verification.
 
 Example `basis.json`:
 
@@ -131,7 +150,8 @@ no model runs and measures no agent-runtime behavior.
 
 ## Boundaries
 
-- The capability is default-off and task-scoped: turns receive the retirement context only when the task explicitly declares a retirement basis or enables the capability; the CLI (verify/inspect) remains the shared verification entry.
+- The capability is default-off and task-scoped: turns receive the retirement context only when the selected task explicitly declares a retirement basis or enables the capability in its own canonical input; the CLI (verify/inspect) remains the shared verification entry.
+- The selected Todo is the intent source. The hook reads the native work context and the Goal registry; it never infers targets from unrelated business fields and never reads the process working directory as source evidence.
 - Delete-first requires target old logic to be cleanly decommissioned in the diff without re-introducing wrappers or zombie symbols.
 - Symbol retirement certification requires an explicitly bound workspace; diff-only evidence can reject but never certifies.
 - AST-based diff hygiene verifies exact code diffs without mutating repository code or performing speculative git writes.
