@@ -1035,3 +1035,101 @@ def test_typescript_parenthesized_expression_is_not_function_def() -> None:
     assert receipt.verdict == "rejected"
     assert any(f.rule_id == "AE004-INSUFFICIENT_SOURCE_EVIDENCE" for f in receipt.findings)
     assert not any(f.rule_id == "AE002-ZOMBIE_SYMBOL_REINTRODUCED" for f in receipt.findings)
+
+
+def test_typescript_template_literal_interpolation_detected_as_active_ref(tmp_path: Path) -> None:
+    """Verify TS expressions inside `${...}` template interpolations are detected as active refs."""
+    legacy_file = tmp_path / "legacy.ts"
+    legacy_file.write_text("export function new_api() { return 1; }\n", encoding="utf-8")
+    consumer_file = tmp_path / "consumer.ts"
+    consumer_file.write_text("console.log(`${api.old_api()}`);\n", encoding="utf-8")
+
+    diff = """
+--- a/legacy.ts
++++ b/legacy.ts
+@@ -1,4 +1,1 @@
+-export function old_api() {
+-    return 0;
+-}
+ export function new_api() { return 1; }
+"""
+    basis = RetirementBasis(target_symbols=("old_api",))
+    receipt = evaluate_diff_hygiene(diff, basis, workspace=tmp_path)
+    assert receipt.verdict == "rejected"
+    assert any(f.rule_id.startswith("AE002") and "consumer.ts" in f.message for f in receipt.findings)
+    assert "old_api" not in receipt.retired_symbols
+
+
+def test_typescript_url_line_with_code_detected_as_active_ref(tmp_path: Path) -> None:
+    """Verify // inside string literals (e.g. URLs) does not strip code on the same line."""
+    legacy_file = tmp_path / "legacy.ts"
+    legacy_file.write_text("export function new_api() { return 1; }\n", encoding="utf-8")
+    consumer_file = tmp_path / "consumer.ts"
+    consumer_file.write_text(
+        "const url = 'https://example.invalid'; console.log(api.old_api());\n",
+        encoding="utf-8",
+    )
+
+    diff = """
+--- a/legacy.ts
++++ b/legacy.ts
+@@ -1,4 +1,1 @@
+-export function old_api() {
+-    return 0;
+-}
+ export function new_api() { return 1; }
+"""
+    basis = RetirementBasis(target_symbols=("old_api",))
+    receipt = evaluate_diff_hygiene(diff, basis, workspace=tmp_path)
+    assert receipt.verdict == "rejected"
+    assert any(f.rule_id.startswith("AE002") and "consumer.ts" in f.message for f in receipt.findings)
+    assert "old_api" not in receipt.retired_symbols
+
+
+def test_typescript_migrated_template_string_without_interpolation_passes(tmp_path: Path) -> None:
+    """Verify plain string text inside backticks mentioning the old symbol does not block retirement."""
+    legacy_file = tmp_path / "legacy.ts"
+    legacy_file.write_text("export function new_api() { return 1; }\n", encoding="utf-8")
+    consumer_file = tmp_path / "consumer.ts"
+    consumer_file.write_text(
+        "console.log(`Retired old_api successfully, now running new_api`);\n",
+        encoding="utf-8",
+    )
+
+    diff = """
+--- a/legacy.ts
++++ b/legacy.ts
+@@ -1,4 +1,1 @@
+-export function old_api() {
+-    return 0;
+-}
+ export function new_api() { return 1; }
+"""
+    basis = RetirementBasis(target_symbols=("old_api",))
+    receipt = evaluate_diff_hygiene(diff, basis, workspace=tmp_path)
+    assert receipt.verdict == "passed"
+    assert "old_api" in receipt.retired_symbols
+    assert len(receipt.findings) == 0
+
+
+def test_typescript_unclosed_syntax_reports_insufficient_evidence(tmp_path: Path) -> None:
+    """Verify unclosed/unparseable JS/TS syntax reports AE004 rather than false pass."""
+    legacy_file = tmp_path / "legacy.ts"
+    legacy_file.write_text("export function new_api() { return 1; }\n", encoding="utf-8")
+    broken_file = tmp_path / "broken.ts"
+    broken_file.write_text("const x = `hello ${old_api;\n", encoding="utf-8")
+
+    diff = """
+--- a/legacy.ts
++++ b/legacy.ts
+@@ -1,4 +1,1 @@
+-export function old_api() {
+-    return 0;
+-}
+ export function new_api() { return 1; }
+"""
+    basis = RetirementBasis(target_symbols=("old_api",))
+    receipt = evaluate_diff_hygiene(diff, basis, workspace=tmp_path)
+    assert receipt.verdict == "rejected"
+    assert any(f.rule_id.startswith("AE004") for f in receipt.findings)
+    assert "old_api" not in receipt.retired_symbols

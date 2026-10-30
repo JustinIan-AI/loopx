@@ -14,6 +14,8 @@ from loopx.capabilities.anti_entropy import (
     build_anti_entropy_turn_context,
     run_anti_entropy_feedback_cycle,
 )
+from loopx.capabilities.anti_entropy.contract import RetirementBasis
+from loopx.capabilities.anti_entropy.turn_context import anti_entropy_context_result
 
 CLEAN_DIFF = """
 --- a/service.py
@@ -473,3 +475,174 @@ def test_attach_turn_context_integration(tmp_path: Path) -> None:
     assert "anti_entropy_guidance" in payload
     assert payload["anti_entropy_guidance"]["status"] == "active"
     assert payload["anti_entropy_guidance"]["target_symbols"] == ["old_api"]
+
+
+def test_feedback_cycle_pure_path_delivery_ready(tmp_path: Path) -> None:
+    """A pure path retirement task with file deleted in diff and absent on disk is delivery ready."""
+    (tmp_path / "service.py").write_text("pass\n", encoding="utf-8")
+    # legacy.py does not exist on disk
+    diff = """
+--- a/legacy.py
++++ /dev/null
+@@ -1,3 +0,0 @@
+-def dead():
+-    pass
+"""
+    basis = RetirementBasis(target_paths=("legacy.py",))
+    result = run_anti_entropy_feedback_cycle(
+        diff_text=diff, basis=basis, goal_id="g1", workspace=tmp_path
+    )
+    assert result["ok"] is True
+    assert result["verdict"] == "passed"
+    assert result["delivery_ready"] is True
+    assert result["is_progress_fact"] is False
+    assert result["retired_symbols"] == []
+    assert len(result["actionable_feedback"]) == 0
+
+
+def test_feedback_cycle_pure_path_retained_in_workspace_blocks(tmp_path: Path) -> None:
+    """A path deleted in diff but still physically present in workspace blocks with AE004."""
+    (tmp_path / "legacy.py").write_text("def dead(): pass\n", encoding="utf-8")
+    diff = """
+--- a/legacy.py
++++ /dev/null
+@@ -1,3 +0,0 @@
+-def dead():
+-    pass
+"""
+    basis = RetirementBasis(target_paths=("legacy.py",))
+    result = run_anti_entropy_feedback_cycle(
+        diff_text=diff, basis=basis, goal_id="g1", workspace=tmp_path
+    )
+    assert result["verdict"] == "rejected"
+    assert result["delivery_ready"] is False
+    assert result["is_progress_fact"] is True
+    assert any(f["rule_id"].startswith("AE004") for f in result["actionable_feedback"])
+
+
+def test_feedback_cycle_pure_path_not_deleted_in_diff_blocks(tmp_path: Path) -> None:
+    """A path not deleted in the diff blocks with AE001."""
+    diff = """
+--- a/legacy.py
++++ b/legacy.py
+@@ -1,3 +1,3 @@
+-def dead():
++def modified():
+     pass
+"""
+    basis = RetirementBasis(target_paths=("legacy.py",))
+    result = run_anti_entropy_feedback_cycle(
+        diff_text=diff, basis=basis, goal_id="g1", workspace=tmp_path
+    )
+    assert result["verdict"] == "rejected"
+    assert result["delivery_ready"] is False
+    assert any(f["rule_id"].startswith("AE001") for f in result["actionable_feedback"])
+
+
+def test_feedback_cycle_empty_basis_not_delivery_ready(tmp_path: Path) -> None:
+    """An empty retirement basis without targets never becomes delivery ready."""
+    basis = RetirementBasis()
+    result = run_anti_entropy_feedback_cycle(
+        diff_text=CLEAN_DIFF, basis=basis, goal_id="g1", workspace=tmp_path
+    )
+    assert result["delivery_ready"] is False
+
+
+def test_feedback_cycle_mixed_targets_both_required(tmp_path: Path) -> None:
+    """Mixed targets (symbol + path) require both to be certified for delivery readiness."""
+    service = tmp_path / "service.py"
+    service.write_text("def new_api(): return 1\n", encoding="utf-8")
+    # legacy.py absent from workspace
+
+    clean_both_diff = """
+--- a/service.py
++++ b/service.py
+@@ -1,3 +1,1 @@
+-def old_api():
+-    return 0
+ def new_api(): return 1
+--- a/legacy.py
++++ /dev/null
+@@ -1,2 +0,0 @@
+-pass
+"""
+    basis = RetirementBasis(target_symbols=("old_api",), target_paths=("legacy.py",))
+    res_both = run_anti_entropy_feedback_cycle(
+        diff_text=clean_both_diff, basis=basis, goal_id="g1", workspace=tmp_path
+    )
+    assert res_both["verdict"] == "passed"
+    assert res_both["delivery_ready"] is True
+    assert res_both["retired_symbols"] == ["old_api"]
+
+    # Symbol retired, but legacy.py still present on disk
+    (tmp_path / "legacy.py").write_text("pass\n", encoding="utf-8")
+    res_retained_path = run_anti_entropy_feedback_cycle(
+        diff_text=clean_both_diff, basis=basis, goal_id="g1", workspace=tmp_path
+    )
+    assert res_retained_path["verdict"] == "rejected"
+    assert res_retained_path["delivery_ready"] is False
+    (tmp_path / "legacy.py").unlink()
+
+    # Path deleted, but symbol definition still on disk
+    service.write_text("def new_api(): return 1\ndef old_api(): return 0\n", encoding="utf-8")
+    res_retained_symbol = run_anti_entropy_feedback_cycle(
+        diff_text=clean_both_diff, basis=basis, goal_id="g1", workspace=tmp_path
+    )
+    assert res_retained_symbol["verdict"] == "rejected"
+    assert res_retained_symbol["delivery_ready"] is False
+
+
+def test_turn_context_extracts_native_route_and_envelope_selected_todos() -> None:
+    """Verify retirement basis is extracted from native route and turn_envelope structures."""
+    # 1. Route selected_todo
+    payload_route = {
+        "route": {
+            "selected_todo": {
+                "todo_id": "todo-rt-1",
+                "retirement_basis": {"target_symbols": ["old_route_func"]},
+            }
+        }
+    }
+    res_route = anti_entropy_context_result(payload_route, goal_id="g1", decision={})
+    assert res_route["readback"]["anti_entropy_guidance"]["status"] == "active"
+    assert res_route["readback"]["anti_entropy_guidance"]["target_symbols"] == ["old_route_func"]
+    assert "anti_entropy_context" in res_route["context_fields"]
+
+    # 2. Turn envelope action selected_todo with metadata
+    payload_envelope = {
+        "turn_envelope": {
+            "action": {
+                "selected_todo": {
+                    "todo_id": "todo-env-1",
+                    "metadata": {"retirement_basis": {"target_symbols": ["old_env_func"]}},
+                }
+            }
+        }
+    }
+    res_env = anti_entropy_context_result(payload_envelope, goal_id="g1", decision={})
+    assert res_env["readback"]["anti_entropy_guidance"]["status"] == "active"
+    assert res_env["readback"]["anti_entropy_guidance"]["target_symbols"] == ["old_env_func"]
+
+    # 3. Decision selected_todo with params
+    decision_params = {
+        "selected_todo": {
+            "todo_id": "todo-dec-1",
+            "params": {"retirement_basis": {"target_paths": ["old_dec.py"]}},
+        }
+    }
+    res_dec = anti_entropy_context_result({}, goal_id="g1", decision=decision_params)
+    assert res_dec["readback"]["anti_entropy_guidance"]["status"] == "active"
+    assert res_dec["readback"]["anti_entropy_guidance"]["target_paths"] == ["old_dec.py"]
+
+    # 4. Route selected_todo with JSON string in note
+    payload_note = {
+        "route": {
+            "selected_todo": {
+                "todo_id": "todo-note-1",
+                "note": '{"target_symbols": ["old_note_func"]}',
+            }
+        }
+    }
+    res_note = anti_entropy_context_result(payload_note, goal_id="g1", decision={})
+    assert res_note["readback"]["anti_entropy_guidance"]["status"] == "active"
+    assert res_note["readback"]["anti_entropy_guidance"]["target_symbols"] == ["old_note_func"]

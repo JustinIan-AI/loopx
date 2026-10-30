@@ -306,33 +306,241 @@ def _extract_ts_defs(lines: list[str]) -> set[str]:
     return defs
 
 
+def _tokenize_ts_code(text: str) -> tuple[str, bool]:
+    """Tokenize and strip comments and string-literal spans from TS/JS code.
+
+    Preserves code expressions inside template string interpolations (`${` ... `}`),
+    ensuring that active references to target symbols are preserved while plain
+    template text and string literals are replaced with spaces.
+    Handles nested template literals, brace nesting inside expressions, and
+    escaped characters.
+    Returns (stripped_code, is_clean) where is_clean is False if syntax has
+    unclosed template literals, block comments, or unclosed strings.
+    """
+    out: list[str] = []
+    i = 0
+    n = len(text)
+    stack: list[Any] = []  # items: 'template' or {'type': 'expr', 'brace_depth': int}
+
+    while i < n:
+        if not stack:
+            # Top-level code
+            if text[i : i + 2] == "//":
+                while i < n and text[i] != "\n":
+                    out.append(" ")
+                    i += 1
+                if i < n and text[i] == "\n":
+                    out.append("\n")
+                    i += 1
+            elif text[i : i + 2] == "/*":
+                out.append(" ")
+                out.append(" ")
+                i += 2
+                closed = False
+                while i < n:
+                    if text[i : i + 2] == "*/":
+                        out.append(" ")
+                        out.append(" ")
+                        i += 2
+                        closed = True
+                        break
+                    out.append("\n" if text[i] == "\n" else " ")
+                    i += 1
+                if not closed:
+                    return "".join(out), False
+            elif text[i] == '"':
+                out.append(" ")
+                i += 1
+                closed = False
+                while i < n:
+                    if text[i] == "\\":
+                        out.append(" ")
+                        out.append(" ")
+                        i += 2 if i + 1 < n else 1
+                        continue
+                    if text[i] == '"':
+                        out.append(" ")
+                        i += 1
+                        closed = True
+                        break
+                    if text[i] == "\n":
+                        break
+                    out.append(" ")
+                    i += 1
+                if not closed:
+                    return "".join(out), False
+            elif text[i] == "'":
+                out.append(" ")
+                i += 1
+                closed = False
+                while i < n:
+                    if text[i] == "\\":
+                        out.append(" ")
+                        out.append(" ")
+                        i += 2 if i + 1 < n else 1
+                        continue
+                    if text[i] == "'":
+                        out.append(" ")
+                        i += 1
+                        closed = True
+                        break
+                    if text[i] == "\n":
+                        break
+                    out.append(" ")
+                    i += 1
+                if not closed:
+                    return "".join(out), False
+            elif text[i] == "`":
+                out.append(" ")
+                i += 1
+                stack.append("template")
+            else:
+                out.append(text[i])
+                i += 1
+        elif stack[-1] == "template":
+            # Inside template literal
+            if text[i : i + 2] == "${":
+                out.append(" ")
+                out.append(" ")
+                i += 2
+                stack.append({"type": "expr", "brace_depth": 1})
+            elif text[i] == "`":
+                out.append(" ")
+                i += 1
+                stack.pop()
+            elif text[i] == "\\":
+                out.append(" ")
+                out.append(" ")
+                i += 2 if i + 1 < n else 1
+            else:
+                out.append("\n" if text[i] == "\n" else " ")
+                i += 1
+        else:
+            # Inside template interpolation expression
+            top = stack[-1]
+            if text[i : i + 2] == "//":
+                while i < n and text[i] != "\n":
+                    out.append(" ")
+                    i += 1
+                if i < n and text[i] == "\n":
+                    out.append("\n")
+                    i += 1
+            elif text[i : i + 2] == "/*":
+                out.append(" ")
+                out.append(" ")
+                i += 2
+                closed = False
+                while i < n:
+                    if text[i : i + 2] == "*/":
+                        out.append(" ")
+                        out.append(" ")
+                        i += 2
+                        closed = True
+                        break
+                    out.append("\n" if text[i] == "\n" else " ")
+                    i += 1
+                if not closed:
+                    return "".join(out), False
+            elif text[i] == '"':
+                out.append(" ")
+                i += 1
+                closed = False
+                while i < n:
+                    if text[i] == "\\":
+                        out.append(" ")
+                        out.append(" ")
+                        i += 2 if i + 1 < n else 1
+                        continue
+                    if text[i] == '"':
+                        out.append(" ")
+                        i += 1
+                        closed = True
+                        break
+                    if text[i] == "\n":
+                        break
+                    out.append(" ")
+                    i += 1
+                if not closed:
+                    return "".join(out), False
+            elif text[i] == "'":
+                out.append(" ")
+                i += 1
+                closed = False
+                while i < n:
+                    if text[i] == "\\":
+                        out.append(" ")
+                        out.append(" ")
+                        i += 2 if i + 1 < n else 1
+                        continue
+                    if text[i] == "'":
+                        out.append(" ")
+                        i += 1
+                        closed = True
+                        break
+                    if text[i] == "\n":
+                        break
+                    out.append(" ")
+                    i += 1
+                if not closed:
+                    return "".join(out), False
+            elif text[i] == "`":
+                out.append(" ")
+                i += 1
+                stack.append("template")
+            elif text[i] == "{":
+                top["brace_depth"] += 1
+                out.append("{")
+                i += 1
+            elif text[i] == "}":
+                top["brace_depth"] -= 1
+                if top["brace_depth"] == 0:
+                    stack.pop()
+                    out.append(" ")
+                    i += 1
+                else:
+                    out.append("}")
+                    i += 1
+            else:
+                out.append(text[i])
+                i += 1
+
+    return "".join(out), len(stack) == 0
+
+
 def _strip_ts_line(line: str) -> str:
-    """Strip // comments and string-literal spans from a TS/JS-like line."""
-    line = re.sub(r"//.*$", "", line)
-    line = re.sub(r"/\*.*?(?:\*/|$)", "", line)
-    line = re.sub(r'"(?:\\.|[^"\\])*"', '""', line)
-    line = re.sub(r"'(?:\\.|[^'\\])*'", "''", line)
-    line = re.sub(r"`(?:\\.|[^`\\])*`", "``", line)
-    return line
+    """Strip // comments and string-literal spans from a TS/JS-like line, preserving template interpolations."""
+    stripped, _ = _tokenize_ts_code(line)
+    return stripped
 
 
 def _extract_ts_refs(
     lines: list[str],
     target_symbols: set[str],
 ) -> set[str]:
+    refs, _ = _extract_ts_refs_with_syntax_check(lines, target_symbols)
+    return refs
+
+
+def _extract_ts_refs_with_syntax_check(
+    lines: list[str],
+    target_symbols: set[str],
+) -> tuple[set[str], bool]:
     """Extract real references to target symbols in TS/JS-like lines.
 
-    Strips comments and string-literal spans, then searches for whole-word identifier
-    matches. Definition lines only exclude the declared symbol identifier at its definition
-    site; cross-file imports, member calls (e.g. api.old_api()), and arrow expressions
-    referencing target_symbols are recorded as active references.
+    Preserves lexical boundaries: template string text, string literals, and
+    comments are stripped, while executable code inside template interpolations
+    is preserved.
     """
     refs: set[str] = set()
     if not target_symbols:
-        return refs
+        return refs, True
 
-    for raw_line in lines:
-        stripped = _strip_ts_line(raw_line)
+    full_text = "\n".join(lines)
+    stripped_text, is_clean = _tokenize_ts_code(full_text)
+    stripped_lines = stripped_text.splitlines()
+
+    for i, raw_line in enumerate(lines):
+        stripped = stripped_lines[i] if i < len(stripped_lines) else ""
         if not stripped.strip():
             continue
 
@@ -354,7 +562,7 @@ def _extract_ts_refs(
             if s in words:
                 refs.add(s)
 
-    return refs
+    return refs, is_clean
 
 
 def _extract_defs_for_file(lines: list[str], file_path: str = "", is_full_file: bool = False) -> set[str]:
@@ -496,7 +704,12 @@ def _scan_workspace(workspace: Path, symbols: tuple[str, ...]) -> _WorkspaceEvid
             else:
                 content_lines = content.splitlines()
                 defs = _extract_ts_defs(content_lines)
-                refs = _extract_ts_refs(content_lines, symbol_set)
+                refs, syntax_ok = _extract_ts_refs_with_syntax_check(content_lines, symbol_set)
+                if not syntax_ok:
+                    evidence.scan_incomplete = True
+                    evidence.incomplete_reason = f"Source file '{rel}' has unclosed or unparseable JS/TS syntax"
+                    skipped.append(rel)
+                    continue
 
             for s in symbol_set:
                 if s in defs:

@@ -23,7 +23,11 @@ def run_anti_entropy_verify(
     retirement. Without it, verdicts can reject but never certify retirement
     (AE004 insufficient source evidence).
     """
-    basis = RetirementBasis.from_dict(basis_data) if basis_data is not None else None
+    basis = (
+        basis_data
+        if isinstance(basis_data, RetirementBasis)
+        else (RetirementBasis.from_dict(basis_data) if basis_data is not None else None)
+    )
     receipt = evaluate_diff_hygiene(diff_text, basis, workspace=workspace)
 
     blocking_count = sum(1 for f in receipt.findings if f.severity == "blocking")

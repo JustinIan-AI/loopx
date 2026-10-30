@@ -32,6 +32,8 @@ class RetirementBasis:
 
     @classmethod
     def from_dict(cls, data: Any) -> RetirementBasis:
+        if isinstance(data, cls):
+            return data
         if not isinstance(data, Mapping):
             raise TypeError(
                 f"RetirementBasis data must be a JSON object (mapping), got {type(data).__name__}"

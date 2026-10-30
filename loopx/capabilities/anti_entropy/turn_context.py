@@ -14,53 +14,105 @@ from .feedback import build_anti_entropy_turn_context
 ANTI_ENTROPY_CONTEXT_MAX_RESULT_BYTES = 64 * 1024
 
 
+def _extract_basis_candidate(candidate: Any) -> RetirementBasis | None:
+    """Recursively search for a valid RetirementBasis in a candidate object or dictionary."""
+    if candidate is None:
+        return None
+    if isinstance(candidate, RetirementBasis):
+        return candidate if (candidate.target_symbols or candidate.target_paths) else None
+    if isinstance(candidate, str):
+        candidate_clean = candidate.strip()
+        if (candidate_clean.startswith("{") and candidate_clean.endswith("}")) or (
+            candidate_clean.startswith("[") and candidate_clean.endswith("]")
+        ):
+            try:
+                parsed = json.loads(candidate_clean)
+                return _extract_basis_candidate(parsed)
+            except Exception:
+                pass
+        return None
+    if isinstance(candidate, Mapping):
+        # 1. Direct explicit retirement_basis or anti_entropy_basis keys
+        for key in ("retirement_basis", "anti_entropy_basis"):
+            if key in candidate:
+                b = _extract_basis_candidate(candidate[key])
+                if b is not None:
+                    return b
+
+        # 2. anti_entropy block
+        if "anti_entropy" in candidate and isinstance(candidate["anti_entropy"], Mapping):
+            b = _extract_basis_candidate(candidate["anti_entropy"])
+            if b is not None:
+                return b
+
+        # 3. Containers commonly holding task params or metadata
+        for container_key in ("metadata", "params", "task_spec", "task_parameters"):
+            if container_key in candidate:
+                b = _extract_basis_candidate(candidate[container_key])
+                if b is not None:
+                    return b
+
+        # 4. Direct basis shape (target_symbols or target_paths)
+        if "target_symbols" in candidate or "target_paths" in candidate:
+            try:
+                b = RetirementBasis.from_dict(candidate)
+                if b.target_symbols or b.target_paths:
+                    return b
+            except Exception:
+                pass
+
+        # 5. String fields that might store JSON payload
+        for text_key in ("note", "description", "instruction"):
+            text_val = candidate.get(text_key)
+            if isinstance(text_val, str):
+                b = _extract_basis_candidate(text_val)
+                if b is not None:
+                    return b
+
+    return None
+
+
 def _resolve_retirement_basis(
     payload: Mapping[str, Any],
     decision: Mapping[str, Any],
 ) -> RetirementBasis | None:
     """Extract a declared retirement basis from turn payload, decision, or selected todo."""
     candidates = [
+        # Top-level direct fields
         payload.get("retirement_basis"),
         payload.get("anti_entropy_basis"),
-        payload.get("anti_entropy", {}).get("retirement_basis")
-        if isinstance(payload.get("anti_entropy"), Mapping)
-        else None,
+        payload.get("anti_entropy"),
         decision.get("retirement_basis"),
         decision.get("anti_entropy_basis"),
-        decision.get("anti_entropy", {}).get("retirement_basis")
-        if isinstance(decision.get("anti_entropy"), Mapping)
-        else None,
+        decision.get("anti_entropy"),
+
+        # Native route and turn_envelope selected todos
+        payload.get("route", {}).get("selected_todo")
+        if isinstance(payload.get("route"), Mapping) else None,
+        payload.get("turn_envelope", {}).get("action", {}).get("selected_todo")
+        if isinstance(payload.get("turn_envelope"), Mapping)
+        and isinstance(payload.get("turn_envelope", {}).get("action"), Mapping) else None,
+        payload.get("turn_envelope", {}).get("selected_todo")
+        if isinstance(payload.get("turn_envelope"), Mapping) else None,
+
+        # Top-level and task fields
+        payload.get("selected_todo"),
+        payload.get("task"),
+
+        # Decision-side selected todos
+        decision.get("selected_todo"),
+        decision.get("action", {}).get("selected_todo")
+        if isinstance(decision.get("action"), Mapping) else None,
+        decision.get("route", {}).get("selected_todo")
+        if isinstance(decision.get("route"), Mapping) else None,
+        decision.get("task"),
     ]
 
-    selected_todo = payload.get("selected_todo")
-    if isinstance(selected_todo, Mapping):
-        candidates.extend(
-            [
-                selected_todo.get("retirement_basis"),
-                selected_todo.get("anti_entropy_basis"),
-            ]
-        )
+    for cand in candidates:
+        basis = _extract_basis_candidate(cand)
+        if basis is not None:
+            return basis
 
-    task = payload.get("task")
-    if isinstance(task, Mapping):
-        candidates.extend(
-            [
-                task.get("retirement_basis"),
-                task.get("anti_entropy_basis"),
-            ]
-        )
-
-    for item in candidates:
-        if item is not None:
-            if isinstance(item, RetirementBasis):
-                return item
-            if isinstance(item, Mapping):
-                try:
-                    basis = RetirementBasis.from_dict(item)
-                    if basis.target_symbols or basis.target_paths:
-                        return basis
-                except Exception:
-                    pass
     return None
 
 
@@ -70,9 +122,12 @@ def _is_anti_entropy_enabled(
     basis: RetirementBasis | None,
 ) -> bool:
     """Determine whether anti-entropy capability is enabled for this turn."""
-    if payload.get("anti_entropy_enabled") is True:
+    # If an explicit retirement basis was declared, capability is implicitly enabled for that task
+    if basis is not None and (basis.target_symbols or basis.target_paths):
         return True
-    if decision.get("anti_entropy_enabled") is True:
+
+    # Check direct payload and decision enablement
+    if payload.get("anti_entropy_enabled") is True or decision.get("anti_entropy_enabled") is True:
         return True
 
     ae_payload = payload.get("anti_entropy")
@@ -81,6 +136,11 @@ def _is_anti_entropy_enabled(
 
     ae_decision = decision.get("anti_entropy")
     if isinstance(ae_decision, Mapping) and ae_decision.get("enabled") is True:
+        return True
+
+    # Check route and turn_envelope boundary capabilities
+    route = payload.get("route")
+    if isinstance(route, Mapping) and route.get("anti_entropy_enabled") is True:
         return True
 
     envelope = payload.get("turn_envelope")
@@ -95,9 +155,26 @@ def _is_anti_entropy_enabled(
                 if ae_cap is True:
                     return True
 
-    # If an explicit retirement basis was declared, capability is implicitly enabled for that task
-    if basis is not None and (basis.target_symbols or basis.target_paths):
-        return True
+    # Check selected todos for anti_entropy_enabled flag
+    todos_to_check = [
+        payload.get("selected_todo"),
+        payload.get("route", {}).get("selected_todo") if isinstance(payload.get("route"), Mapping) else None,
+        payload.get("turn_envelope", {}).get("action", {}).get("selected_todo")
+        if isinstance(payload.get("turn_envelope"), Mapping)
+        and isinstance(payload.get("turn_envelope", {}).get("action"), Mapping) else None,
+        decision.get("selected_todo"),
+        decision.get("action", {}).get("selected_todo") if isinstance(decision.get("action"), Mapping) else None,
+    ]
+    for td in todos_to_check:
+        if isinstance(td, Mapping):
+            if td.get("anti_entropy_enabled") is True:
+                return True
+            meta = td.get("metadata")
+            if isinstance(meta, Mapping) and meta.get("anti_entropy_enabled") is True:
+                return True
+            params = td.get("params")
+            if isinstance(params, Mapping) and params.get("anti_entropy_enabled") is True:
+                return True
 
     return False
 

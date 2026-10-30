@@ -24,6 +24,7 @@ from typing import Any, Mapping
 
 from .agent_tool import anti_entropy_inspect
 from .contract import AntiEntropyFinding, RetirementBasis
+from .oracles import normalize_repo_path
 
 _INSPECT_CLI_ROUTE = (
     "loopx anti-entropy inspect --diff-file <diff.patch|-> "
@@ -194,7 +195,33 @@ def run_anti_entropy_feedback_cycle(
         )
     )
     declared_symbols = list(basis_obj.target_symbols) if basis_obj is not None else []
-    all_targets_retired = bool(declared_symbols) and all(s in retired for s in declared_symbols)
+    declared_paths = list(basis_obj.target_paths) if basis_obj is not None else []
+    has_declared_targets = bool(declared_symbols or declared_paths)
+
+    symbols_retired = (
+        not declared_symbols
+        or (bool(declared_symbols) and all(s in retired for s in declared_symbols))
+    )
+
+    finding_locations = {f.get("location") for f in findings if f.get("location")}
+    paths_clean = True
+    if declared_paths:
+        if any(p in finding_locations for p in declared_paths):
+            paths_clean = False
+        elif workspace is not None:
+            workspace_path = Path(workspace).resolve()
+            if workspace_path.exists():
+                for p in declared_paths:
+                    norm = normalize_repo_path(p)
+                    if norm != "/dev/null" and (workspace_path / norm).resolve().exists():
+                        paths_clean = False
+                        break
+            else:
+                paths_clean = False
+        else:
+            paths_clean = False
+
+    all_targets_retired = has_declared_targets and symbols_retired and paths_clean
 
     delivery_ready = (
         verdict == "passed"
